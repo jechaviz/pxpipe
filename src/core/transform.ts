@@ -54,7 +54,7 @@ import {
   ANTHROPIC_HISTORY_IMAGE_BUDGET,
 } from './history.js';
 import type { HistoryCollapseInfo } from './history.js';
-import { noteHistoryRequest, recordFreezeStep, sessionAnchorText } from './session-state.js';
+import { isRateLimitCircuitOpen, noteHistoryRequest, recordFreezeStep, sessionAnchorText } from './session-state.js';
 import type { GptHistoryOptions } from './openai-history.js';
 import { CACHE_CREATE_RATE, CACHE_READ_RATE } from './baseline.js';
 import { visionTokens, type VisionPricing } from './vision-cost.js';
@@ -2709,6 +2709,14 @@ export async function transformRequest(
   // systemSha8 is set later, after we know the combined image-bound text.
   await recordSessionIdentity(info, firstUserText(req), o.claudeCodeSessionId);
   const firstUserSha = info.firstUserSha8;
+
+  // Circuit breaker: this session has hit the provider's rate limit on
+  // several requests in a row. Fall back to plain text so this request has
+  // a chance to complete and repopulate the session's own prefix cache.
+  if (isRateLimitCircuitOpen(info.sessionKey ?? firstUserSha)) {
+    info.reason = 'compress=false (rate_limit_circuit_open)';
+    return { body, info };
+  }
 
   // Canary: slab tags whose content churns within a session bust the image
   // cache every turn — report them regardless of the hardcoded lists.

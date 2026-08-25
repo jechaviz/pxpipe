@@ -16,6 +16,7 @@
 
 import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
+import { connect as netConnect } from 'node:net';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -45,11 +46,13 @@ export interface WarpRuntime {
  * telemetry, the control plane — is re-originated untouched, which is what
  * keeps the agent's client-side gates satisfied.
  */
-function defaultRoutes(port: number): Route[] {
+export function defaultRoutes(port: number): Route[] {
   return [
     parseRoute(`api.anthropic.com/v1/messages*=http://127.0.0.1:${port}`),
     parseRoute(`daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent*=http://127.0.0.1:${port}`),
     parseRoute(`daily-cloudcode-pa.googleapis.com/v1internal:generateContent*=http://127.0.0.1:${port}`),
+    parseRoute(`cloudcode-pa.googleapis.com/v1internal:streamGenerateContent*=http://127.0.0.1:${port}`),
+    parseRoute(`cloudcode-pa.googleapis.com/v1internal:generateContent*=http://127.0.0.1:${port}`),
     parseRoute(`generativelanguage.googleapis.com/v1beta/models/*:streamGenerateContent*=http://127.0.0.1:${port}`),
     parseRoute(`generativelanguage.googleapis.com/v1beta/models/*:generateContent*=http://127.0.0.1:${port}`),
     parseRoute(`generativelanguage.googleapis.com/v1/models/*:streamGenerateContent*=http://127.0.0.1:${port}`),
@@ -276,16 +279,32 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
     }
     console.error(`[pxpipe] warp exec → ${command.join(' ')}`);
 
-    proxy.on('error', (err) => {
-      console.error(`[pxpipe] warp: proxy listener failed: ${err.message}`);
-      process.exit(1);
+    const startChildProxy = () => {
+      proxy.on('error', (err) => {
+        console.error(`[pxpipe] warp: proxy listener failed: ${err.message}`);
+        process.exit(1);
+      });
+      proxy.listen(0, '127.0.0.1', () => {
+        const address = proxy.address();
+        const proxyUrl = `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`;
+        console.error(`[pxpipe] warp proxy → ${proxyUrl} (child only)`);
+        spawnChild(command, proxyUrl);
+      });
+    };
+
+    // Only reuse the main server's CONNECT handler when no custom --route rules were requested;
+    // custom rules live only on this warp instance's handler.
+    if (options.routes && options.routes.length > 0) {
+      startChildProxy();
+      return;
+    }
+
+    const testSocket = netConnect({ host: '127.0.0.1', port }, () => {
+      testSocket.destroy();
+      console.error(`[pxpipe] warp → reusing running proxy at http://127.0.0.1:${port}`);
+      spawnChild(command, `http://127.0.0.1:${port}`);
     });
-    proxy.listen(0, '127.0.0.1', () => {
-      const address = proxy.address();
-      const proxyUrl = `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`;
-      console.error(`[pxpipe] warp proxy → ${proxyUrl} (child only)`);
-      spawnChild(command, proxyUrl);
-    });
+    testSocket.on('error', startChildProxy);
   };
 
   return { launch };

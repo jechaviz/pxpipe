@@ -14,6 +14,7 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import { isIP } from 'node:net';
 import { spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import {
   createProxy,
   parseGatewayHeaders,
@@ -48,6 +49,7 @@ import {
   type DashboardRoute,
 } from './dashboard.js';
 import { runStats } from './stats.js';
+import type { SplitBlock } from './core/split-block.js';
 
 /** Runtime config. The core transform tuning comes from DEFAULTS in
  *  transform.ts; startup knobs cover deployment plus emergency GPT scope
@@ -344,6 +346,10 @@ Environment:
                           liveness) survive a restart; 0/off disables
                           (default ~/.pxpipe/session-state.json). Without it a
                           restart drops every live session's floor.
+  PXPIPE_PLUGIN           module path (./, /, ~/) or package name that exports a
+                          splitBlock hook (named or default export). The hook
+                          decides, per block, image, text, or text and image
+                          segments. See src/core/split-block.ts. Off unless set.
   PXPIPE_DUMP_DIR         debug: write every rendered PNG here (what the model
                           sees); off unless set. Compress arm only.
   PXPIPE_RENDER_CACHE_BYTES  max bytes of rendered pages to keep in memory
@@ -1189,6 +1195,27 @@ async function runExport(argv: string[]): Promise<void> {
 
 // ---- main ----------------------------------------------------------------
 
+/**
+ * PXPIPE_PLUGIN: a module path or package name whose `splitBlock` export (or
+ * default export) is a SplitBlock hook. Paths (`./`, `../`, `/`, `~/`) resolve
+ * from the working directory; a bare package name resolves from pxpipe's own
+ * install, like any import.
+ */
+async function loadSplitBlockPlugin(): Promise<SplitBlock | null> {
+  const raw = process.env.PXPIPE_PLUGIN?.trim();
+  if (!raw) return null;
+  const spec = raw.startsWith('~/') ? path.join(os.homedir(), raw.slice(2)) : raw;
+  const isPath = spec.startsWith('.') || path.isAbsolute(spec);
+  const loaded = (await import(isPath ? pathToFileURL(path.resolve(spec)).href : spec)) as {
+    splitBlock?: unknown;
+    default?: unknown;
+  };
+  const hook = loaded.splitBlock ?? loaded.default;
+  if (typeof hook !== 'function') throw new Error(`PXPIPE_PLUGIN ${spec} exports no splitBlock function`);
+  console.log(`[pxpipe] PXPIPE_PLUGIN set — splitBlock hook loaded from ${spec}`);
+  return hook as SplitBlock;
+}
+
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   if (argv[0] === 'export') {
@@ -1255,6 +1282,7 @@ async function main(): Promise<void> {
   const trustAdjacent = resolveTrustAdjacentToolRoundsEnv(process.env.PXPIPE_TRUST_ADJACENT_TOOL_ROUNDS);
   const trustAdjacentToolRounds = trustAdjacent.value;
   if (trustAdjacent.warning) console.warn(trustAdjacent.warning);
+  const splitBlock = await loadSplitBlockPlugin();
   if (forcePassthrough) {
     console.log('[pxpipe] PXPIPE_DISABLE set — passthrough mode (compress=false), still logging usage + baselines');
   }
@@ -1374,9 +1402,10 @@ async function main(): Promise<void> {
       // (The dashboard kill switch does the same thing at runtime.)
       if (forcePassthrough || !dashboard.getCompressionEnabled()) return { compress: false };
       // Active path: use DEFAULTS in transform.ts for break-even gating.
-      return trustAdjacentToolRounds === undefined
-        ? {}
-        : { separateAdjacentToolPairs: trustAdjacentToolRounds };
+      return {
+        ...(trustAdjacentToolRounds === undefined ? {} : { separateAdjacentToolPairs: trustAdjacentToolRounds }),
+        ...(splitBlock ? { splitBlock } : {}),
+      };
     },
     onRequest: async (e) => {
       // Feed the dashboard BEFORE tracker.emit — toTrackEvent strips

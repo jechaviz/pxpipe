@@ -1,6 +1,7 @@
+import { deflateSync } from 'node:zlib';
 import { createCanvas, loadImage } from '@napi-rs/canvas';
 import { describe, expect, it } from 'vitest';
-import { encodeGrayPng, encodeRgbPng } from '../src/core/png.js';
+import { bytesToBase64, configurePngRuntime, encodeGrayPng, encodeRgbPng } from '../src/core/png.js';
 
 /**
  * The encoder applies PNG's Average scanline filter, which must be bit-exact
@@ -118,6 +119,31 @@ describe('PNG encoder is lossless', () => {
       expect([out.data[i * 4], out.data[i * 4 + 1], out.data[i * 4 + 2]]).toEqual([
         pixels[i * 3], pixels[i * 3 + 1], pixels[i * 3 + 2],
       ]);
+    }
+  });
+
+  it('round-trips bit-exact with node:zlib deflateSync fast path and matches Buffer base64', async () => {
+    const pixels = new Uint8Array(W * H);
+    const palette = [0, 31, 68, 119, 255];
+    for (let i = 0; i < pixels.length; i++) pixels[i] = palette[(i * 7 + (i >> 3)) % palette.length]!;
+    try {
+      configurePngRuntime({
+        deflateZlib: (input) => {
+          const out = deflateSync(input, { level: 1 });
+          return new Uint8Array(out.buffer, out.byteOffset, out.byteLength);
+        },
+      });
+      const png = await encodeGrayPng(pixels, W, H);
+      expect(png[24]).toBe(4);
+      expect(png[25]).toBe(3);
+      expect(bytesToBase64(png)).toBe(Buffer.from(png).toString('base64'));
+      const out = await decode(png);
+      expect([out.w, out.h]).toEqual([W, H]);
+      for (let i = 0; i < pixels.length; i++) {
+        expect(out.data[i * 4]).toBe(pixels[i]);
+      }
+    } finally {
+      configurePngRuntime({ deflateZlib: null, bytesToBase64: null });
     }
   });
 });

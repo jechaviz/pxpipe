@@ -17,6 +17,8 @@ import * as os from 'node:os';
 import { isIP } from 'node:net';
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
+import { deflateSync } from 'node:zlib';
+import { configurePngRuntime } from './core/png.js';
 import {
   createProxy,
   parseGatewayHeaders,
@@ -1218,7 +1220,28 @@ async function loadSplitBlockPlugin(): Promise<SplitBlock | null> {
   return hook as SplitBlock;
 }
 
+function initNodePngFastPath(): void {
+  const raw = process.env.PXPIPE_PNG_DEFLATE_LEVEL?.trim();
+  if (raw && /^(off|web|stream)$/i.test(raw)) return;
+  let level = 1;
+  if (raw !== undefined && raw !== '') {
+    const parsed = Number(raw);
+    if (Number.isInteger(parsed) && parsed >= 0 && parsed <= 9) {
+      level = parsed;
+    } else {
+      console.warn(`[pxpipe] ignoring invalid PXPIPE_PNG_DEFLATE_LEVEL=${raw} (want 0-9 or off)`);
+    }
+  }
+  configurePngRuntime({
+    deflateZlib: (input) => {
+      const out = deflateSync(input, { level });
+      return new Uint8Array(out.buffer, out.byteOffset, out.byteLength);
+    },
+  });
+}
+
 async function main(): Promise<void> {
+  initNodePngFastPath();
   const argv = process.argv.slice(2);
   if (argv[0] === 'export') {
     await runExport(argv.slice(1));

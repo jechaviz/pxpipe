@@ -54,9 +54,31 @@ function chunk(type: string, data: Uint8Array): Uint8Array {
   return concat([u32be(data.length), typeB, data, u32be(crc32(crcSrc))]);
 }
 
-// ---- Deflate via Web Streams ---------------------------------------------
+// ---- Runtime acceleration hook (edge-safe: zero node:* imports here) -----
+
+export type DeflateZlibFn = (input: Uint8Array) => Uint8Array | Promise<Uint8Array>;
+export type BytesToBase64Fn = (bytes: Uint8Array) => string;
+
+let customDeflateZlib: DeflateZlibFn | null = null;
+let customBytesToBase64: BytesToBase64Fn | null = null;
+
+/**
+ * Optional host hook to accelerate PNG deflate / base64 on runtimes like Node
+ * (`node:zlib` deflateSync) without importing Node built-ins into the Worker-safe
+ * core module. Pass `null` to restore the portable Web Streams / btoa defaults.
+ */
+export function configurePngRuntime(opts: {
+  deflateZlib?: DeflateZlibFn | null;
+  bytesToBase64?: BytesToBase64Fn | null;
+}): void {
+  if ('deflateZlib' in opts) customDeflateZlib = opts.deflateZlib ?? null;
+  if ('bytesToBase64' in opts) customBytesToBase64 = opts.bytesToBase64 ?? null;
+}
+
+// ---- Deflate via Web Streams (or registered host fast path) --------------
 
 async function deflateZlib(input: Uint8Array): Promise<Uint8Array> {
+  if (customDeflateZlib) return customDeflateZlib(input);
   // 'deflate' = RFC 1950 zlib-wrapped — what PNG IDAT needs. 'deflate-raw' (RFC 1951) would be wrong.
   const cs = new CompressionStream('deflate');
   const writer = cs.writable.getWriter();
@@ -267,8 +289,11 @@ export async function encodeRgbPng(pixels: Uint8Array, width: number, height: nu
   ]);
 }
 
-/** Base64-encode bytes. Chunks to avoid call-stack blow-up from String.fromCharCode(...bigArray). */
+/** Base64-encode bytes. Uses Buffer on Node/Bun (~140x faster), falls back to chunked btoa on edge/browsers. */
 export function bytesToBase64(bytes: Uint8Array): string {
+  if (customBytesToBase64) return customBytesToBase64(bytes);
+  const B = (globalThis as { Buffer?: { from: (buf: ArrayBufferLike, offset: number, len: number) => { toString: (enc: 'base64') => string } } }).Buffer;
+  if (B) return B.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('base64');
   let binary = '';
   const CHUNK = 0x8000;
   for (let i = 0; i < bytes.length; i += CHUNK) {

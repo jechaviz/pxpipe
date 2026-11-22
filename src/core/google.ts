@@ -980,6 +980,127 @@ export function normalizeGoogleTurnRoles(contents: GoogleContent[]): GoogleConte
   return merged;
 }
 
+const LOOP_GUARD_MARKER = '[pxpipe/TokenEconomizer Loop Guard]';
+const TOOL_FAIL_TEXT_RE =
+  /(?:\b(?:exited with (?:code|status)\s+[1-9]\d*|exit (?:code|status)\s*[:=]\s*[1-9]\d*|command failed|ENOENT|EACCES|ERR_MODULE_NOT_FOUND|target not found)\b|Traceback \(most recent call last\)|(?:SyntaxError|TypeError|ReferenceError|FileNotFoundError|PermissionError|ModuleNotFoundError):)/i;
+
+function isFailedToolResponseTurn(turn: GoogleContent): boolean {
+  if (turn.role !== 'user' || !Array.isArray(turn.parts)) return false;
+  const responses = turn.parts.filter((p) => p && typeof p.functionResponse === 'object' && p.functionResponse !== null);
+  if (responses.length === 0) return false;
+  for (const part of responses) {
+    const resp = part.functionResponse?.response;
+    if (resp && typeof resp === 'object' && !Array.isArray(resp)) {
+      const rec = resp as Record<string, unknown>;
+      if (rec.error || rec.isError === true || rec.is_error === true || rec.ok === false || rec.success === false) {
+        return true;
+      }
+      const exitCode = rec.exitCode ?? rec.exit_code ?? rec.statusCode ?? rec.returnCode;
+      if (typeof exitCode === 'number' && exitCode !== 0) {
+        return true;
+      }
+    }
+    const text = typeof resp === 'string' ? resp : JSON.stringify(resp ?? '');
+    if (text && TOOL_FAIL_TEXT_RE.test(text)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function toolCallSignature(turn: GoogleContent): string | null {
+  if (turn.role !== 'model' || !Array.isArray(turn.parts)) return null;
+  const calls = turn.parts
+    .filter((p) => p && typeof p.functionCall === 'object' && p.functionCall !== null)
+    .map((p) => ({
+      name: p.functionCall?.name ?? '',
+      args: p.functionCall?.args ?? null,
+    }));
+  if (calls.length === 0) return null;
+  try {
+    return JSON.stringify(calls);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Wire-level Loop Guard for Gemini / Antigravity streams:
+ * Detects 3+ consecutive failing tool responses or 3+ identical consecutive tool
+ * calls in the live tail and appends a short intervention note ONLY to the last
+ * user turn so the earlier prefix remains byte-identical for Gemini caching.
+ */
+export function applyGoogleLoopGuard(contents: GoogleContent[]): GoogleContent[] {
+  if (typeof process !== 'undefined' && process.env?.PXPIPE_DISABLE_LOOP_GUARD === '1') {
+    return contents;
+  }
+  if (contents.length < 6) return contents;
+  const lastIdx = contents.length - 1;
+  const lastTurn = contents[lastIdx];
+  if (!lastTurn || lastTurn.role !== 'user' || !Array.isArray(lastTurn.parts)) {
+    return contents;
+  }
+  const hasFnResp = lastTurn.parts.some((p) => p && typeof p.functionResponse === 'object' && p.functionResponse !== null);
+  if (!hasFnResp) return contents;
+  if (lastTurn.parts.some((p) => typeof p?.text === 'string' && p.text.includes(LOOP_GUARD_MARKER))) {
+    return contents;
+  }
+
+  // Inspect trailing tool turns without crossing back past a human prompt turn.
+  const recentToolRespTurns: GoogleContent[] = [];
+  const recentToolCallSigs: string[] = [];
+  const minIdx = Math.max(0, contents.length - 14);
+  for (let i = lastIdx; i >= minIdx; i--) {
+    const t = contents[i];
+    if (!t || !Array.isArray(t.parts)) break;
+    if (t.role === 'user') {
+      const isToolResp = t.parts.some((p) => p && typeof p.functionResponse === 'object' && p.functionResponse !== null);
+      if (!isToolResp) break;
+      recentToolRespTurns.push(t);
+    } else if (t.role === 'model') {
+      const sig = toolCallSignature(t);
+      if (!sig) break;
+      recentToolCallSigs.push(sig);
+    } else {
+      break;
+    }
+  }
+
+  let consecutiveFailures = 0;
+  for (const t of recentToolRespTurns) {
+    if (isFailedToolResponseTurn(t)) consecutiveFailures++;
+    else break;
+  }
+
+  let identicalCalls = 0;
+  if (recentToolCallSigs.length >= 3) {
+    const latestSig = recentToolCallSigs[0];
+    for (const sig of recentToolCallSigs) {
+      if (sig === latestSig) identicalCalls++;
+      else break;
+    }
+  }
+
+  let note: string | null = null;
+  if (consecutiveFailures >= 3) {
+    note =
+      `${LOOP_GUARD_MARKER} The last ${consecutiveFailures} consecutive tool responses failed. ` +
+      'Stop repeating the same failing approach — diagnose the root cause from the error output, change strategy, or inspect the target before retrying.';
+  } else if (identicalCalls >= 3) {
+    note =
+      `${LOOP_GUARD_MARKER} The last ${identicalCalls} consecutive tool calls were identical. ` +
+      'Stop repeating the same call — use the output you already have or choose a different approach.';
+  }
+
+  if (!note) return contents;
+  const out = contents.slice();
+  out[lastIdx] = {
+    ...lastTurn,
+    parts: [...lastTurn.parts, { text: note }],
+  };
+  return out;
+}
+
 export async function transformGoogleGenerateContent(
   bodyBytes: Uint8Array,
   modelName: string,
@@ -1252,7 +1373,9 @@ export async function transformGoogleGenerateContent(
     }
   }
 
-  const normalizedContents = normalizeGeminiThoughtSignatures(normalizeGoogleTurnRoles(contents));
+  const normalizedContents = normalizeGeminiThoughtSignatures(
+    normalizeGoogleTurnRoles(applyGoogleLoopGuard(contents)),
+  );
 
   // Keep a native system-level pointer so the imaged instruction retains its
   // original authority instead of being demoted to ordinary user content.

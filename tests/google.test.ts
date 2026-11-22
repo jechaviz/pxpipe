@@ -7,6 +7,7 @@ import {
   transformGoogleGenerateContent,
   parseGoogleModelFromPath,
   normalizeGoogleTurnRoles,
+  applyGoogleLoopGuard,
 } from '../src/core/google.js';
 import { geminiVisionTokens } from '../src/core/gemini-model-profiles.js';
 
@@ -950,6 +951,64 @@ describe('transformGoogleGenerateContent', () => {
       expect(normalized[0]?.parts).toEqual([{ text: 'part 1' }, { text: 'part 2' }]);
       expect(normalized[1]?.role).toBe('model');
       expect(normalized[2]?.role).toBe('user');
+    });
+  });
+
+  describe('applyGoogleLoopGuard', () => {
+    it('appends a loop-guard intervention only to the last user turn after 3 consecutive failing tool responses', () => {
+      const turns = [
+        { role: 'user', parts: [{ text: 'Fix the failing build.' }] },
+        { role: 'model', parts: [{ functionCall: { name: 'run_command', args: { cmd: 'npm test' } } }] },
+        { role: 'user', parts: [{ functionResponse: { name: 'run_command', response: { output: 'Command exited with code 1' } } }] },
+        { role: 'model', parts: [{ functionCall: { name: 'run_command', args: { cmd: 'npm test -- --run' } } }] },
+        { role: 'user', parts: [{ functionResponse: { name: 'run_command', response: { output: 'TypeError: x is not a function' } } }] },
+        { role: 'model', parts: [{ functionCall: { name: 'run_command', args: { cmd: 'npm run build' } } }] },
+        { role: 'user', parts: [{ functionResponse: { name: 'run_command', response: { exitCode: 2, output: 'failed' } } }] },
+      ];
+
+      const guarded = applyGoogleLoopGuard(turns);
+      expect(guarded).toHaveLength(turns.length);
+      // Earlier turns remain byte-identical for prefix caching.
+      expect(guarded.slice(0, -1)).toEqual(turns.slice(0, -1));
+      const lastParts = guarded[guarded.length - 1]?.parts ?? [];
+      expect(lastParts).toHaveLength(2);
+      expect(lastParts[1]?.text).toContain('[pxpipe/TokenEconomizer Loop Guard]');
+      expect(lastParts[1]?.text).toContain('3 consecutive tool responses failed');
+      // Idempotent if called again.
+      expect(applyGoogleLoopGuard(guarded)).toEqual(guarded);
+    });
+
+    it('appends a loop-guard intervention after 3 identical consecutive tool calls', () => {
+      const turns = [
+        { role: 'user', parts: [{ text: 'Inspect config.' }] },
+        { role: 'model', parts: [{ functionCall: { name: 'read_file', args: { path: 'a.ts' } } }] },
+        { role: 'user', parts: [{ functionResponse: { name: 'read_file', response: { output: 'ok 1' } } }] },
+        { role: 'model', parts: [{ functionCall: { name: 'read_file', args: { path: 'a.ts' } } }] },
+        { role: 'user', parts: [{ functionResponse: { name: 'read_file', response: { output: 'ok 2' } } }] },
+        { role: 'model', parts: [{ functionCall: { name: 'read_file', args: { path: 'a.ts' } } }] },
+        { role: 'user', parts: [{ functionResponse: { name: 'read_file', response: { output: 'ok 3' } } }] },
+      ];
+
+      const guarded = applyGoogleLoopGuard(turns);
+      const lastParts = guarded[guarded.length - 1]?.parts ?? [];
+      expect(lastParts).toHaveLength(2);
+      expect(lastParts[1]?.text).toContain('[pxpipe/TokenEconomizer Loop Guard]');
+      expect(lastParts[1]?.text).toContain('3 consecutive tool calls were identical');
+    });
+
+    it('does not trigger on normal varied succeeding tool rounds', () => {
+      const turns = [
+        { role: 'user', parts: [{ text: 'Inspect files.' }] },
+        { role: 'model', parts: [{ functionCall: { name: 'read_file', args: { path: 'a.ts' } } }] },
+        { role: 'user', parts: [{ functionResponse: { name: 'read_file', response: { output: 'ok' } } }] },
+        { role: 'model', parts: [{ functionCall: { name: 'read_file', args: { path: 'b.ts' } } }] },
+        { role: 'user', parts: [{ functionResponse: { name: 'read_file', response: { output: 'Command exited with code 1' } } }] },
+        { role: 'model', parts: [{ functionCall: { name: 'read_file', args: { path: 'c.ts' } } }] },
+        { role: 'user', parts: [{ functionResponse: { name: 'read_file', response: { output: 'all good' } } }] },
+      ];
+
+      const guarded = applyGoogleLoopGuard(turns);
+      expect(guarded).toBe(turns);
     });
   });
 });

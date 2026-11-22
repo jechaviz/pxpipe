@@ -1724,7 +1724,7 @@ let responseContentType: string | undefined;
           // GPT image/baseline telemetry and renders As text / Saved as dashes.
           accountingProvider: isGoogleRoute
             ? 'google'
-            : isOpenAIChatWire || isOpenAIResponsesWire || bridgedGptMessages || bridgedChatMessages
+            : isOpenAIChatWire || isOpenAIResponsesWire || isChatGPTCodexPath(url.pathname) || isOpenAIPath || bridgedGptMessages || bridgedChatMessages
               ? 'openai'
               : 'anthropic',
           status,

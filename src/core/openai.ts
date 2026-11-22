@@ -33,6 +33,7 @@ import {
   type TransformOptions,
 } from './transform.js';
 import { visionTokens } from './vision-cost.js';
+import { isRateLimitCircuitOpen } from './session-state.js';
 import { computeOpenAICollapsePaybackReads } from './openai-savings.js';
 import { stripSchemaDescriptions } from './schema-strip.js';
 import {
@@ -1183,6 +1184,10 @@ export async function transformOpenAIChatCompletions(
     info.sessionKey = info.firstUserSha8;
     info.sessionKeySource = 'anchor';
   }
+  if (isRateLimitCircuitOpen(info.sessionKey ?? info.firstUserSha8)) {
+    info.reason = 'compress=false (rate_limit_circuit_open)';
+    return { body: pinBody, info };
+  }
 
   const combined = compactSlabWhitespace(combinedRaw).trimEnd();
   const minCompressTokens = profile.minCompressTokens;
@@ -1444,6 +1449,10 @@ export async function transformOpenAIResponses(
     info.firstUserSha8 = await sha8(firstUser);
     info.sessionKey = info.firstUserSha8;
     info.sessionKeySource = 'anchor';
+  }
+  if (isRateLimitCircuitOpen(info.sessionKey ?? info.firstUserSha8)) {
+    info.reason = 'compress=false (rate_limit_circuit_open)';
+    return { body: pinBody, info };
   }
 
   const combined = compactSlabWhitespace(combinedRaw).trimEnd();

@@ -33,6 +33,7 @@ import { factSheetText } from './factsheet.js';
 import { stripSchemaDescriptions } from './schema-strip.js';
 import { relocateGooglePins } from './pin.js';
 import { compactPreview, verbatimTaskText } from './history.js';
+import { isRateLimitCircuitOpen } from './session-state.js';
 export interface GooglePart {
   text?: string;
   inlineData?: {
@@ -966,6 +967,39 @@ export async function transformGoogleGenerateContent(
   let fsText: string | null = null;
   let renderedText = '';
 
+  // Validate contents and extract session key BEFORE rendering so malformed
+  // requests and rate-limit-tripped sessions skip imaging CPU completely.
+  if (req.contents !== undefined && !Array.isArray(req.contents)) {
+    return { body: pinBody, info: createDefaultInfo(modelName) };
+  }
+  const originalContents = Array.isArray(req.contents) ? [...req.contents] : [];
+  for (const content of originalContents) {
+    if (!record(content) || (content.parts !== undefined && !Array.isArray(content.parts))) {
+      return { body: pinBody, info: createDefaultInfo(modelName) };
+    }
+  }
+  for (const content of originalContents) {
+    if (content.role === 'model' || !Array.isArray(content.parts)) continue;
+    const textParts: string[] = [];
+    for (const rawPart of content.parts) {
+      const part = record(rawPart);
+      if (part && typeof part.text === 'string' && !part.thought) {
+        textParts.push(part.text);
+      }
+    }
+    const prompt = extractGoogleUserPrompt(textParts);
+    if (prompt?.text) {
+      info.firstUserSha8 = await sha8(prompt.text.slice(0, 4096));
+      info.sessionKey = info.firstUserSha8;
+      info.sessionKeySource = 'anchor';
+      break;
+    }
+  }
+  if (isRateLimitCircuitOpen(info.sessionKey ?? info.firstUserSha8)) {
+    info.reason = 'compress=false (rate_limit_circuit_open)';
+    return withStampedThoughtSignatures(req, pinBody, info, isEnvelope ? reqRecord : undefined);
+  }
+
   if (combinedRaw) {
     const combined = compactSlabWhitespace(combinedRaw).trimEnd();
     info.systemSha8 = await sha8(combined);
@@ -1010,33 +1044,6 @@ export async function transformGoogleGenerateContent(
   const imageParts: GooglePart[] = staticProfitable ? staticImages.map(imagePart) : [];
   if (staticProfitable && fsText) {
     imageParts.push({ text: fsText });
-  }
-
-  // Prepare transformed request. Plan history against the ORIGINAL contents;
-  // inserting the slab image first would make content[0] an opaque image barrier.
-  if (req.contents !== undefined && !Array.isArray(req.contents)) {
-    return { body: pinBody, info: createDefaultInfo(modelName) };
-  }
-  const originalContents = Array.isArray(req.contents) ? [...req.contents] : [];
-  for (const content of originalContents) {
-    if (!record(content) || (content.parts !== undefined && !Array.isArray(content.parts))) {
-      return { body: pinBody, info: createDefaultInfo(modelName) };
-    }
-  }
-  for (const content of originalContents) {
-    if (content.role === 'model' || !Array.isArray(content.parts)) continue;
-    const textParts: string[] = [];
-    for (const rawPart of content.parts) {
-      const part = record(rawPart);
-      if (part && typeof part.text === 'string' && !part.thought) {
-        textParts.push(part.text);
-      }
-    }
-    const prompt = extractGoogleUserPrompt(textParts);
-    if (prompt?.text) {
-      info.firstUserSha8 = await sha8(prompt.text.slice(0, 4096));
-      break;
-    }
   }
 
   const historyPlan = options.collapseHistory === false

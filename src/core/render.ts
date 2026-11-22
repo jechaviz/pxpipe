@@ -77,7 +77,8 @@ import {
   ATLAS_GRAY_WIDE_FLAGS as JBM14_GRAY_WIDE_FLAGS,
   atlasGrayRank as jbMono14GrayRank,
 } from './atlas-gray-jbmono14.js';
-import { encodeGrayPng, encodeRgbPng } from './png.js';
+import { clearFactSheetCache } from './factsheet.js';
+import { bytesToBase64, encodeGrayPng, encodeRgbPng } from './png.js';
 
 export type RenderFont = 'spleen-5x8' | 'jetbrains-mono-10' | 'jetbrains-mono-12' | 'jetbrains-mono-14';
 export const DEFAULT_RENDER_FONT: RenderFont = 'spleen-5x8';
@@ -284,6 +285,8 @@ export function maxCharsPerImage(cols: number): number {
 
 export interface RenderedImage {
   png: Uint8Array;
+  /** Precomputed base64 representation of `png` so warm cache hits avoid re-encoding. */
+  base64?: string;
   width: number;
   height: number;
   /** Input codepoints rendered (wide chars count as 1, not 2). */
@@ -1106,7 +1109,15 @@ export async function renderChunkToPng(
   } else {
     png = await encodeGrayPng(fb, width, height);
   }
-  return { png, width, height, charsRendered, droppedChars, droppedCodepoints };
+  return {
+    png,
+    base64: bytesToBase64(png),
+    width,
+    height,
+    charsRendered,
+    droppedChars,
+    droppedCodepoints,
+  };
 }
 
 /** Reflow-aware variant of renderTextToPngs. Falls back to non-reflow on sentinel collision. */
@@ -1259,6 +1270,7 @@ export function clearRenderCache(): void {
   renderCacheMisses = 0;
   renderCacheEvictions = 0;
   renderCacheOversized = 0;
+  clearFactSheetCache();
 }
 
 /**
@@ -1269,6 +1281,7 @@ export function evictRenderCacheForSleep(): number {
   const freed = renderCacheBytes;
   renderCache.clear();
   renderCacheBytes = 0;
+  clearFactSheetCache();
   return freed;
 }
 

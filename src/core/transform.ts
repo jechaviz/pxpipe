@@ -1928,7 +1928,7 @@ export async function textToImageBlocks(
   const droppedCodepoints = new Map<number, number>();
   const blocks: ImageBlock[] = [];
   for (const img of imgs) {
-    blocks.push(makeImageBlock(bytesToBase64(img.png), false));
+    blocks.push(makeImageBlock(img.base64 ?? bytesToBase64(img.png), false));
     droppedChars += img.droppedChars;
     pixels += img.width * img.height;
     for (const [cp, n] of img.droppedCodepoints) {

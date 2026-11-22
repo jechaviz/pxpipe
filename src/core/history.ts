@@ -1108,7 +1108,7 @@ export async function collapseHistory(
           source: {
             type: 'base64',
             media_type: 'image/png',
-            data: bytesToBase64(img.png),
+            data: img.base64 ?? bytesToBase64(img.png),
           },
         });
         countImage(img);

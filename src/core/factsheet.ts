@@ -129,6 +129,18 @@ export interface FactSheetEntry {
   readonly count: number;
 }
 
+const FACTSHEET_CACHE_CAP = 512;
+const factSheetEntryCache = new Map<string, FactSheetEntry[]>();
+const factSheetAllPagesCache = new Map<string, { kept: FactSheetEntry[]; dropped: number }>();
+
+/** Drop all cached fact-sheet extractions (called on render cache reset / idle sleep). */
+export function clearFactSheetCache(): number {
+  const evicted = factSheetEntryCache.size + factSheetAllPagesCache.size;
+  factSheetEntryCache.clear();
+  factSheetAllPagesCache.clear();
+  return evicted;
+}
+
 /**
  * Like `extractFactSheetTokens`, but each kept token carries its occurrence count.
  * Counts make the fact sheet a *quantitative* index: tally questions over imaged
@@ -140,6 +152,12 @@ export interface FactSheetEntry {
  */
 export function extractFactSheetEntries(text: string): FactSheetEntry[] {
   const scan = text.length > MAX_SCAN ? text.slice(0, MAX_SCAN) : text;
+  const cached = factSheetEntryCache.get(scan);
+  if (cached !== undefined) {
+    factSheetEntryCache.delete(scan);
+    factSheetEntryCache.set(scan, cached);
+    return cached.slice();
+  }
   const counts = new Map<string, number>();
   for (const chunk of scan.split(/\s+/)) {
     if (chunk.length < MIN_LEN || chunk.length > MAX_CHUNK) continue;
@@ -166,7 +184,7 @@ export function extractFactSheetEntries(text: string): FactSheetEntry[] {
   const ordered = [...counts.keys()].sort((a, b) => b.length - a.length || (a < b ? -1 : a > b ? 1 : 0));
   const specific: string[] = [];
   for (const t of ordered) {
-    if (!specific.some((k) => k.includes(t))) specific.push(t);
+    if (!specific.some((k) => k.length > t.length && k.includes(t))) specific.push(t);
   }
   // Phase 2 — allocate the budget by priority tier (shape, not length) so short,
   // zero-redundancy tokens (SHAs, ports, flags) can never be evicted by long low-risk URLs.
@@ -181,7 +199,13 @@ export function extractFactSheetEntries(text: string): FactSheetEntry[] {
     if (tier === 2 && urls++ >= MAX_URLS) continue;
     kept.push(t);
   }
-  return kept.map((t) => ({ token: t, count: counts.get(t) ?? 1 }));
+  const result = kept.map((t) => ({ token: t, count: counts.get(t) ?? 1 }));
+  if (factSheetEntryCache.size >= FACTSHEET_CACHE_CAP) {
+    const oldest = factSheetEntryCache.keys().next().value;
+    if (oldest !== undefined) factSheetEntryCache.delete(oldest);
+  }
+  factSheetEntryCache.set(scan, result);
+  return result.slice();
 }
 
 /**
@@ -212,6 +236,13 @@ export function extractFactSheetEntriesAllPages(
   text: string,
   charsPerPage: number,
 ): { kept: FactSheetEntry[]; dropped: number } {
+  const cacheKey = `${charsPerPage}\x00${text}`;
+  const cached = factSheetAllPagesCache.get(cacheKey);
+  if (cached !== undefined) {
+    factSheetAllPagesCache.delete(cacheKey);
+    factSheetAllPagesCache.set(cacheKey, cached);
+    return { kept: cached.kept.slice(), dropped: cached.dropped };
+  }
   const counts = new Map<string, number>();
   const all: string[] = [];
 
@@ -239,7 +270,13 @@ export function extractFactSheetEntriesAllPages(
     kept.push({ token: t, count: counts.get(t) ?? 1 });
   }
 
-  return { kept, dropped: all.length - kept.length };
+  const result = { kept, dropped: all.length - kept.length };
+  if (factSheetAllPagesCache.size >= FACTSHEET_CACHE_CAP) {
+    const oldest = factSheetAllPagesCache.keys().next().value;
+    if (oldest !== undefined) factSheetAllPagesCache.delete(oldest);
+  }
+  factSheetAllPagesCache.set(cacheKey, result);
+  return { kept: result.kept.slice(), dropped: result.dropped };
 }
 
 const OPEN =

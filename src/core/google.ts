@@ -843,7 +843,7 @@ function imagePart(image: RenderedImage): GooglePart {
   return {
     inlineData: {
       mimeType: 'image/png',
-      data: bytesToBase64(image.png),
+      data: image.base64 ?? bytesToBase64(image.png),
     },
   };
 }
@@ -1199,7 +1199,7 @@ export async function transformGoogleGenerateContent(
 
   if (historyPlan && historyPlan.images.length > 0) {
     info.historyImageSha = await sha8(
-      historyPlan.images.map((image) => bytesToBase64(image.png)).join(''),
+      historyPlan.images.map((image) => image.base64 ?? bytesToBase64(image.png)).join(''),
     );
   }
   const totalPixels = info.imageDims.reduce((sum, d) => sum + d.width * d.height, 0);

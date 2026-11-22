@@ -608,7 +608,7 @@ function openAIImagePart(img: RenderedImage, model?: string): OpenAIImagePart {
   return {
     type: 'image_url',
     image_url: {
-      url: `data:image/png;base64,${bytesToBase64(img.png)}`,
+      url: `data:image/png;base64,${img.base64 ?? bytesToBase64(img.png)}`,
       detail: openAIImageDetail(model),
     },
   };
@@ -618,7 +618,7 @@ function openAIImagePart(img: RenderedImage, model?: string): OpenAIImagePart {
 function responsesImagePart(img: RenderedImage, model?: string): ResponsesInputImagePart {
   return {
     type: 'input_image',
-    image_url: `data:image/png;base64,${bytesToBase64(img.png)}`,
+    image_url: `data:image/png;base64,${img.base64 ?? bytesToBase64(img.png)}`,
     detail: openAIImageDetail(model),
   };
 }

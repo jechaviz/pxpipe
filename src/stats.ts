@@ -57,6 +57,11 @@ export interface Summary {
   eventsWithUsage: number;
   durationMs: number[];
   firstByteMs: number[];
+  transformMs: number[];
+  compressedDurationMs: number[];
+  compressedFirstByteMs: number[];
+  passthroughDurationMs: number[];
+  passthroughFirstByteMs: number[];
   skipReasons: Map<string, number>;
   byCwd: Map<string, { count: number; origChars: number; imageBytes: number }>;
   /** system_sha8 → number of times seen. High repeat count = cache should
@@ -88,6 +93,11 @@ export function newSummary(): Summary {
     eventsWithUsage: 0,
     durationMs: [],
     firstByteMs: [],
+    transformMs: [],
+    compressedDurationMs: [],
+    compressedFirstByteMs: [],
+    passthroughDurationMs: [],
+    passthroughFirstByteMs: [],
     skipReasons: new Map(),
     byCwd: new Map(),
     systemShaHist: new Map(),
@@ -101,13 +111,25 @@ export function fold(s: Summary, ev: TrackEvent): Summary {
   else if (ev.status >= 400 && ev.status < 500) s.err4xx++;
   else if (ev.status >= 500) s.err5xx++;
 
+  const renderedChars =
+    typeof ev.compressed_chars === 'number' &&
+    ev.compressed_chars > (ev.orig_chars ?? 0) &&
+    (ev.accounting_provider === 'google' || ev.accounting_provider === 'openai')
+      ? ev.compressed_chars
+      : ev.orig_chars;
+
   if (ev.compressed === true) {
     s.compressed++;
-    if (typeof ev.orig_chars === 'number') s.origCharsTotal += ev.orig_chars;
+    if (typeof renderedChars === 'number') s.origCharsTotal += renderedChars;
     if (typeof ev.image_bytes === 'number') s.imageBytesTotal += ev.image_bytes;
+    if (typeof ev.transform_ms === 'number') s.transformMs.push(ev.transform_ms);
+    if (typeof ev.duration_ms === 'number') s.compressedDurationMs.push(ev.duration_ms);
+    if (typeof ev.first_byte_ms === 'number') s.compressedFirstByteMs.push(ev.first_byte_ms);
   } else if (ev.compressed === false) {
     s.passthrough++;
     if (ev.reason) s.skipReasons.set(ev.reason, (s.skipReasons.get(ev.reason) ?? 0) + 1);
+    if (typeof ev.duration_ms === 'number') s.passthroughDurationMs.push(ev.duration_ms);
+    if (typeof ev.first_byte_ms === 'number') s.passthroughFirstByteMs.push(ev.first_byte_ms);
   }
 
   // Outside the compressed branch on purpose: the pin footer is appended on
@@ -167,7 +189,7 @@ export function fold(s: Summary, ev: TrackEvent): Summary {
     const k = ev.cwd;
     const e = s.byCwd.get(k) ?? { count: 0, origChars: 0, imageBytes: 0 };
     e.count++;
-    e.origChars += ev.orig_chars ?? 0;
+    e.origChars += renderedChars ?? ev.orig_chars ?? 0;
     e.imageBytes += ev.image_bytes ?? 0;
     s.byCwd.set(k, e);
   }
@@ -230,6 +252,24 @@ export function renderTextReport(s: Summary): string {
   lines.push(
     `  first-byte p50=${percentile(sortedFB, 50)}  p95=${percentile(sortedFB, 95)}  p99=${percentile(sortedFB, 99)}`,
   );
+  if (s.transformMs.length > 0) {
+    const sortedTf = [...s.transformMs].sort((a, b) => a - b);
+    const sortedCompFB = [...s.compressedFirstByteMs].sort((a, b) => a - b);
+    const tfP50 = percentile(sortedTf, 50);
+    const compFbP50 = percentile(sortedCompFB, 50);
+    const overheadPct =
+      compFbP50 > 0 ? `  (proxy overhead: ${((tfP50 / compFbP50) * 100).toFixed(1)}% of TTFT)` : '';
+    lines.push(
+      `  transform p50=${tfP50}  p95=${percentile(sortedTf, 95)}  p99=${percentile(sortedTf, 99)}${overheadPct}`,
+    );
+  }
+  if (s.compressedFirstByteMs.length > 0 && s.passthroughFirstByteMs.length > 0) {
+    const sortedCompFB = [...s.compressedFirstByteMs].sort((a, b) => a - b);
+    const sortedPassFB = [...s.passthroughFirstByteMs].sort((a, b) => a - b);
+    lines.push(
+      `  A/B TTFT  compressed p50=${percentile(sortedCompFB, 50)}ms (n=${s.compressedFirstByteMs.length})  passthrough p50=${percentile(sortedPassFB, 50)}ms (n=${s.passthroughFirstByteMs.length})`,
+    );
+  }
   lines.push('');
 
   lines.push('compression:');
@@ -375,6 +415,9 @@ export function summaryToJson(s: Summary): Record<string, unknown> {
     [...m.entries()].slice(0, n);
   const sortedDur = [...s.durationMs].sort((a, b) => a - b);
   const sortedFB = [...s.firstByteMs].sort((a, b) => a - b);
+  const sortedTf = [...s.transformMs].sort((a, b) => a - b);
+  const sortedCompFB = [...s.compressedFirstByteMs].sort((a, b) => a - b);
+  const sortedPassFB = [...s.passthroughFirstByteMs].sort((a, b) => a - b);
   return {
     total: s.total,
     ok2xx: s.ok2xx,
@@ -400,6 +443,11 @@ export function summaryToJson(s: Summary): Record<string, unknown> {
     durationP95: percentile(sortedDur, 95),
     firstByteP50: percentile(sortedFB, 50),
     firstByteP95: percentile(sortedFB, 95),
+    transformP50: percentile(sortedTf, 50),
+    transformP95: percentile(sortedTf, 95),
+    transformP99: percentile(sortedTf, 99),
+    compressedFirstByteP50: percentile(sortedCompFB, 50),
+    passthroughFirstByteP50: percentile(sortedPassFB, 50),
     skipReasons: topN(s.skipReasons),
     byCwd: topN(s.byCwd),
     systemShaHist: topN(s.systemShaHist),

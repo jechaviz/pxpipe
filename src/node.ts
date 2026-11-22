@@ -55,9 +55,14 @@ import {
   dashboardPath,
   type DashboardRoute,
 } from './dashboard.js';
-import { runStats } from './stats.js';
+import { aggregateEventsFile, runStats } from './stats.js';
 import type { SplitBlock } from './core/split-block.js';
-import { evictRenderCacheForSleep } from './core/render.js';
+import {
+  clearRenderCache,
+  evictRenderCacheForSleep,
+  renderCacheStats,
+} from './core/render.js';
+import { transformGoogleGenerateContent } from './core/google.js';
 
 /** Runtime config. The core transform tuning comes from DEFAULTS in
  *  transform.ts; startup knobs cover deployment plus emergency GPT scope
@@ -311,6 +316,11 @@ Usage:
   pxpipe stats [--json] [--file <p>]
                         summarize the events log offline (no server needed),
                         incl. measured savings; defaults to $PXPIPE_LOG
+  pxpipe pause          pause compression on the live daemon (passthrough mode
+                        with 0ms transform overhead; keeps logging for A/B bench)
+  pxpipe resume         resume compression on the live daemon
+  pxpipe bench          benchmark cold vs warm transform latency and compare
+                        compressed vs passthrough TTFT overhead from $PXPIPE_LOG
 
 The proxy compresses eligible tools, schemas, reminders, tool_results,
 and history; tracks events to disk; and measures real saved_pct via
@@ -750,9 +760,15 @@ async function dispatchDashboard(
       return dashboard.serveFragment(route.name, url, port);
     }
     case 'api-compression': {
+      if (method === 'GET') {
+        return new Response(
+          JSON.stringify({ enabled: dashboard.getCompressionEnabled() }),
+          { status: 200, headers: { 'content-type': 'application/json; charset=utf-8' } },
+        );
+      }
       if (method !== 'POST') {
         return new Response(
-          JSON.stringify({ error: 'use POST' }),
+          JSON.stringify({ error: 'use GET or POST' }),
           { status: 405, headers: { 'content-type': 'application/json' } },
         );
       }
@@ -1272,6 +1288,183 @@ function initNodeCompressionFastPath(): void {
   });
 }
 
+async function setDaemonCompression(enabled: boolean): Promise<void> {
+  const port = Number(process.env.PORT ?? 47821);
+  const host = process.env.HOST?.trim() || '127.0.0.1';
+  const url = `http://${host}:${port}/api/compression`;
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    });
+    if (!res.ok) {
+      console.error(`[pxpipe] failed to toggle compression on ${url}: HTTP ${res.status}`);
+      process.exit(1);
+    }
+    const data = (await res.json()) as { enabled?: boolean; compression_enabled?: boolean };
+    const isEnabled = data.compression_enabled ?? data.enabled;
+    if (isEnabled === false) {
+      console.log(
+        `[pxpipe] compression PAUSED on http://${host}:${port} (passthrough mode — 0ms transform overhead, logging active).`,
+      );
+      console.log(`[pxpipe] run \`pxpipe resume\` to re-enable compression, or \`pxpipe bench\` to inspect latency.`);
+    } else {
+      console.log(`[pxpipe] compression RESUMED on http://${host}:${port} (active).`);
+    }
+  } catch (err) {
+    console.error(`[pxpipe] could not reach daemon at ${url}: ${(err as Error).message}`);
+    process.exit(1);
+  }
+}
+
+function pct(sorted: readonly number[], p: number): number {
+  if (sorted.length === 0) return 0;
+  const idx = Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length));
+  return sorted[idx]!;
+}
+
+async function runBench(): Promise<void> {
+  const port = Number(process.env.PORT ?? 47821);
+  const host = process.env.HOST?.trim() || '127.0.0.1';
+  const url = `http://${host}:${port}/api/compression`;
+  let daemonStatus = 'offline (or unreachable)';
+  try {
+    const res = await fetch(url);
+    if (res.ok) {
+      const data = (await res.json()) as { enabled?: boolean };
+      daemonStatus = data.enabled ? 'ACTIVE (compressing)' : 'PAUSED (passthrough / 0ms transform)';
+    }
+  } catch {
+    /* daemon offline */
+  }
+
+  console.log('--- pxpipe benchmark & latency report ---');
+  console.log(`daemon (${host}:${port}): ${daemonStatus}`);
+  console.log('');
+
+  // 1. In-process synthetic 400-turn (1.35 MB, 72 PNGs) benchmark
+  clearRenderCache();
+  const sysText = 'You are an expert software engineer. '.repeat(2400);
+  const contents: Array<Record<string, unknown>> = [];
+  for (let i = 0; i < 200; i++) {
+    contents.push({
+      role: 'user',
+      parts: [{ text: `Turn ${i}: Inspect module_${i}.ts and optimize hash_${(i * 2654435761 >>> 0).toString(16)}.` }],
+    });
+    contents.push({
+      role: 'model',
+      parts: [
+        {
+          functionCall: {
+            name: 'read_file',
+            args: { path: `src/module_${i}.ts`, startLine: 1, endLine: 200 },
+          },
+        },
+      ],
+    });
+    contents.push({
+      role: 'user',
+      parts: [
+        {
+          functionResponse: {
+            name: 'read_file',
+            response: {
+              output:
+                `// File src/module_${i}.ts\n` +
+                `export function compute_${i}(x: number) { return x * ${i}; }\n`.repeat(95),
+            },
+          },
+        },
+      ],
+    });
+    contents.push({
+      role: 'model',
+      parts: [{ text: `Analyzed src/module_${i}.ts and verified invariants for turn ${i}.` }],
+    });
+  }
+  contents.push({ role: 'user', parts: [{ text: 'Final question: summarize all 200 modules.' }] });
+  const makeBody = () =>
+    new TextEncoder().encode(
+      JSON.stringify({
+        model: 'gemini-4-argon-high',
+        request: {
+          systemInstruction: { parts: [{ text: sysText }] },
+          contents,
+        },
+      }),
+    );
+
+  const b1 = makeBody();
+  const t0 = performance.now();
+  const r1 = await transformGoogleGenerateContent(b1, 'gemini-4-argon-high');
+  const coldMs = performance.now() - t0;
+
+  const b2 = makeBody();
+  const t1 = performance.now();
+  await transformGoogleGenerateContent(b2, 'gemini-4-argon-high');
+  const warm1Ms = performance.now() - t1;
+
+  const b3 = makeBody();
+  const t2 = performance.now();
+  await transformGoogleGenerateContent(b3, 'gemini-4-argon-high');
+  const warm2Ms = performance.now() - t2;
+
+  const cs = renderCacheStats();
+  const speedup = warm2Ms > 0 ? (coldMs / warm2Ms).toFixed(1) : '∞';
+  console.log(
+    `synthetic 400-turn session (${(b1.byteLength / 1024).toFixed(0)} KiB JSON → ${r1.info.imageCount ?? 0} PNG pages):`,
+  );
+  console.log(`  cold turn (0% cache hit, renders all ${r1.info.imageCount ?? 0} PNGs): ${coldMs.toFixed(1)} ms`);
+  console.log(`  warm turn #1 (100% cache hit on sealed chunks):   ${warm1Ms.toFixed(1)} ms`);
+  console.log(`  warm turn #2 (steady-state incremental turn):     ${warm2Ms.toFixed(1)} ms  (${speedup}x faster)`);
+  console.log(`  render cache: ${cs.entries} entries, ${(cs.bytes / (1024 * 1024)).toFixed(2)} MiB, hits=${cs.hits}, misses=${cs.misses}`);
+  console.log('');
+
+  // 2. Real-world telemetry from ~/.pxpipe/events.jsonl
+  const defaultFile = process.env.PXPIPE_LOG ?? DEFAULT_EVENTS_FILE;
+  const agg = await aggregateEventsFile(defaultFile);
+  if (agg && agg.parsed > 0) {
+    const s = agg.summary;
+    const sortedTf = [...s.transformMs].sort((a, b) => a - b);
+    const sortedCompFB = [...s.compressedFirstByteMs].sort((a, b) => a - b);
+    const sortedCompDur = [...s.compressedDurationMs].sort((a, b) => a - b);
+    const sortedPassFB = [...s.passthroughFirstByteMs].sort((a, b) => a - b);
+    const sortedPassDur = [...s.passthroughDurationMs].sort((a, b) => a - b);
+    const tfP50 = pct(sortedTf, 50);
+    const compFbP50 = pct(sortedCompFB, 50);
+    const netUpstreamP50 = Math.max(0, compFbP50 - tfP50);
+    const overheadPct = compFbP50 > 0 ? ((tfP50 / compFbP50) * 100).toFixed(2) : '0.00';
+
+    console.log(`live log telemetry (${defaultFile}, ${s.total} requests):`);
+    console.log(`  compressed turns (n=${s.compressed}):`);
+    console.log(
+      `    proxy transform_ms: p50=${tfP50}ms  p95=${pct(sortedTf, 95)}ms  p99=${pct(sortedTf, 99)}ms`,
+    );
+    console.log(
+      `    total TTFT (first_byte_ms): p50=${compFbP50}ms  p95=${pct(sortedCompFB, 95)}ms  (net upstream TTFT p50≈${netUpstreamP50}ms)`,
+    );
+    console.log(
+      `    total duration_ms:          p50=${pct(sortedCompDur, 50)}ms  p95=${pct(sortedCompDur, 95)}ms`,
+    );
+    console.log(`    proxy TTFT share:           ${overheadPct}% of first-byte latency`);
+    if (s.passthrough > 0) {
+      console.log(`  passthrough turns (n=${s.passthrough}):`);
+      console.log(
+        `    total TTFT (first_byte_ms): p50=${pct(sortedPassFB, 50)}ms  p95=${pct(sortedPassFB, 95)}ms`,
+      );
+      console.log(
+        `    total duration_ms:          p50=${pct(sortedPassDur, 50)}ms  p95=${pct(sortedPassDur, 95)}ms`,
+      );
+    }
+    console.log('');
+  }
+  console.log('live A/B benchmarking commands:');
+  console.log('  pxpipe pause    # switch live daemon to passthrough (0ms transform overhead)');
+  console.log('  pxpipe resume   # re-enable live compression');
+  console.log('  pxpipe bench    # re-run this benchmark & compare compressed vs passthrough turns');
+}
+
 async function main(): Promise<void> {
   initNodeCompressionFastPath();
   const argv = process.argv.slice(2);
@@ -1287,6 +1480,18 @@ async function main(): Promise<void> {
     if (out) process.stdout.write(out + '\n');
     if (err) process.stderr.write(err + '\n');
     process.exit(code); // server never starts
+  }
+  if (argv[0] === 'pause' || argv[0] === 'off') {
+    await setDaemonCompression(false);
+    return;
+  }
+  if (argv[0] === 'resume' || argv[0] === 'on') {
+    await setDaemonCompression(true);
+    return;
+  }
+  if (argv[0] === 'bench' || argv[0] === 'benchmark') {
+    await runBench();
+    return;
   }
   // `warp` runs an agent behind a CONNECT proxy and redirects its inference
   // traffic into the pxpipe already running. It starts no proxy of its own, so

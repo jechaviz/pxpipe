@@ -1,16 +1,44 @@
-import { createServer } from 'node:http';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { createServer, request as httpRequest } from 'node:http';
+import { request as httpsRequest } from 'node:https';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { spawn } from 'node:child_process';
+import { connect as tlsConnect } from 'node:tls';
 import { describe, expect, it } from 'vitest';
 
 import { CertificateAuthority } from '../src/warp/ca.js';
 import { createWarpHandlers } from '../src/warp/connect.js';
-import { parseRoute } from '../src/warp/route.js';
+import { defaultRoutes } from '../src/warp/index.js';
+
+function httpsViaConnect(proxyPort: number, host: string, path: string, caPem: string): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const req = httpRequest({ host: '127.0.0.1', port: proxyPort, method: 'CONNECT', path: `${host}:443` });
+    req.on('connect', (res, socket) => {
+      if (res.statusCode !== 200) {
+        socket.destroy();
+        reject(new Error(`CONNECT failed with ${res.statusCode}`));
+        return;
+      }
+      const tlsSocket = tlsConnect({ socket, servername: host, ca: caPem });
+      const inner = httpsRequest(
+        { host, port: 443, path, method: 'GET', createConnection: () => tlsSocket },
+        (innerRes) => {
+          let body = '';
+          innerRes.setEncoding('utf8');
+          innerRes.on('data', (chunk) => (body += chunk));
+          innerRes.on('end', () => resolve({ status: innerRes.statusCode ?? 0, body }));
+        },
+      );
+      inner.on('error', reject);
+      inner.end();
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
 
 describe('CONNECT proxy and warp integration', () => {
-  it('diverts matching HTTPS requests to the local handler and establishes CONNECT tunnel', async () => {
+  it('diverts matching HTTPS requests (Anthropic + CloudCode PA) to the local handler over CONNECT', async () => {
     const tmpDir = mkdtempSync(join(tmpdir(), 'pxpipe-test-ca-'));
     const ca = CertificateAuthority.loadOrCreate(tmpDir);
     let divertCount = 0;
@@ -23,7 +51,7 @@ describe('CONNECT proxy and warp integration', () => {
       });
     });
 
-    const routes = [parseRoute(`api.anthropic.com/v1/messages*=http://127.0.0.1:${port}`)];
+    const routes = defaultRoutes(port);
     const warpHandlers = createWarpHandlers({
       routes,
       ca,
@@ -37,9 +65,9 @@ describe('CONNECT proxy and warp integration', () => {
         warpHandlers.handleAbsoluteForm(req, res);
         return;
       }
-      if (req.url?.startsWith('/v1/messages')) {
+      if (req.url?.startsWith('/v1/messages') || req.url?.startsWith('/v1internal:streamGenerateContent')) {
         res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, diverted: true }));
+        res.end(JSON.stringify({ ok: true, diverted: true, path: req.url }));
         return;
       }
       res.writeHead(404);
@@ -49,24 +77,16 @@ describe('CONNECT proxy and warp integration', () => {
     testServer.on('connect', warpHandlers.handleConnect);
 
     try {
-      const curl = spawn('curl', [
-        '-x',
-        `http://127.0.0.1:${port}`,
-        '--cacert',
-        ca.certPath,
-        '-s',
-        'https://api.anthropic.com/v1/messages',
-      ]);
+      const caPem = readFileSync(ca.certPath, 'utf8');
+      const anthropic = await httpsViaConnect(port, 'api.anthropic.com', '/v1/messages', caPem);
+      expect(anthropic.status).toBe(200);
+      expect(anthropic.body).toContain('"diverted":true');
 
-      let stdout = '';
-      curl.stdout.on('data', (d) => (stdout += d));
-      const code = await new Promise<number>((resolve) => {
-        curl.on('close', (c) => resolve(c ?? 0));
-      });
+      const cloudcode = await httpsViaConnect(port, 'cloudcode-pa.googleapis.com', '/v1internal:streamGenerateContent', caPem);
+      expect(cloudcode.status).toBe(200);
+      expect(cloudcode.body).toContain('"diverted":true');
 
-      expect(code).toBe(0);
-      expect(stdout).toContain('"diverted":true');
-      expect(divertCount).toBeGreaterThanOrEqual(1);
+      expect(divertCount).toBeGreaterThanOrEqual(2);
     } finally {
       await new Promise<void>((resolve) => testServer.close(() => resolve()));
       rmSync(tmpDir, { recursive: true, force: true });

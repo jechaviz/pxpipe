@@ -547,8 +547,20 @@ function routedModelDisplayName(model: string, route: 'openai' | 'cloudflare'): 
   return `${model} (${route === 'cloudflare' ? 'Cloudflare' : 'OpenAI'})`;
 }
 
-/** Gzip via CompressionStream — available in Node 18+ and Cloudflare Workers. */
+export type GzipBytesFn = (body: Uint8Array) => Uint8Array | Promise<Uint8Array>;
+let customGzipBytes: GzipBytesFn | null = null;
+
+/**
+ * Optional host hook to accelerate outbound gzip compression on Node (`node:zlib`
+ * async gzip) without importing Node built-ins into the Worker-safe core module.
+ */
+export function configureProxyRuntime(opts: { gzipBytes?: GzipBytesFn | null }): void {
+  if ('gzipBytes' in opts) customGzipBytes = opts.gzipBytes ?? null;
+}
+
+/** Gzip via registered host accelerator or Web CompressionStream (Node 18+ and Workers). */
 async function gzipBytes(body: Uint8Array): Promise<Uint8Array> {
+  if (customGzipBytes) return customGzipBytes(body);
   // Cast: TS doesn't model Response(Uint8Array) even though it works in both runtimes.
   const stream = new Response(body as BufferSource).body!.pipeThrough(
     new CompressionStream('gzip'),

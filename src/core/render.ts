@@ -107,6 +107,14 @@ interface AtlasSet {
   gray: GrayAtlas;
 }
 
+/** Precomputed O(1) LUT for ASCII codepoints (0..127), falling back to binary search for non-ASCII. */
+function withAsciiLut(rankFn: (codepoint: number) => number): (codepoint: number) => number {
+  const lut = new Int32Array(128);
+  for (let cp = 0; cp < 128; cp++) lut[cp] = rankFn(cp);
+  return (codepoint: number): number =>
+    codepoint >= 0 && codepoint < 128 ? lut[codepoint]! : rankFn(codepoint);
+}
+
 const DEFAULT_ATLAS: AtlasSet = {
   bit: {
     cellW: ATLAS_CELL_W,
@@ -115,7 +123,7 @@ const DEFAULT_ATLAS: AtlasSet = {
     pixels: ATLAS_PIXELS,
     offsets: ATLAS_OFFSETS,
     wideFlags: ATLAS_WIDE_FLAGS,
-    rank: atlasRank,
+    rank: withAsciiLut(atlasRank),
   },
   gray: {
     cellW: ATLAS_GRAY_CELL_W,
@@ -124,7 +132,7 @@ const DEFAULT_ATLAS: AtlasSet = {
     pixels: ATLAS_GRAY_PIXELS,
     offsets: ATLAS_GRAY_OFFSETS,
     wideFlags: ATLAS_GRAY_WIDE_FLAGS,
-    rank: atlasGrayRank,
+    rank: withAsciiLut(atlasGrayRank),
   },
 };
 
@@ -136,7 +144,7 @@ const JBM10_ATLAS: AtlasSet = {
     pixels: JBM10_PIXELS,
     offsets: JBM10_OFFSETS,
     wideFlags: JBM10_WIDE_FLAGS,
-    rank: jbMono10Rank,
+    rank: withAsciiLut(jbMono10Rank),
   },
   gray: {
     cellW: JBM10_GRAY_CELL_W,
@@ -145,7 +153,7 @@ const JBM10_ATLAS: AtlasSet = {
     pixels: JBM10_GRAY_PIXELS,
     offsets: JBM10_GRAY_OFFSETS,
     wideFlags: JBM10_GRAY_WIDE_FLAGS,
-    rank: jbMono10GrayRank,
+    rank: withAsciiLut(jbMono10GrayRank),
   },
 };
 
@@ -157,7 +165,7 @@ const JBM12_ATLAS: AtlasSet = {
     pixels: JBM12_PIXELS,
     offsets: JBM12_OFFSETS,
     wideFlags: JBM12_WIDE_FLAGS,
-    rank: jbMono12Rank,
+    rank: withAsciiLut(jbMono12Rank),
   },
   gray: {
     cellW: JBM12_GRAY_CELL_W,
@@ -166,7 +174,7 @@ const JBM12_ATLAS: AtlasSet = {
     pixels: JBM12_GRAY_PIXELS,
     offsets: JBM12_GRAY_OFFSETS,
     wideFlags: JBM12_GRAY_WIDE_FLAGS,
-    rank: jbMono12GrayRank,
+    rank: withAsciiLut(jbMono12GrayRank),
   },
 };
 
@@ -178,7 +186,7 @@ const JBM14_ATLAS: AtlasSet = {
     pixels: JBM14_PIXELS,
     offsets: JBM14_OFFSETS,
     wideFlags: JBM14_WIDE_FLAGS,
-    rank: jbMono14Rank,
+    rank: withAsciiLut(jbMono14Rank),
   },
   gray: {
     cellW: JBM14_GRAY_CELL_W,
@@ -187,7 +195,7 @@ const JBM14_ATLAS: AtlasSet = {
     pixels: JBM14_GRAY_PIXELS,
     offsets: JBM14_GRAY_OFFSETS,
     wideFlags: JBM14_GRAY_WIDE_FLAGS,
-    rank: jbMono14GrayRank,
+    rank: withAsciiLut(jbMono14GrayRank),
   },
 };
 
@@ -1394,7 +1402,7 @@ async function renderTextToPngsUncached(
   // the slab budget (READABLE_CHARS_PER_IMAGE) keeps its shorter row cap.
   const linesPerImg = Math.min(hardLinesPerImg, Math.max(1, Math.floor(maxCharsPerImage / cols)));
 
-  const images: RenderedImage[] = [];
+  const jobs: Array<{ chunk: string; slotChunk: string | undefined }> = [];
   let slotCursor = 0;
   for (const page of splitWrappedLinesIntoReadablePages(lines, linesPerImg, maxCharsPerImage)) {
     const chunk = page.join('\n');
@@ -1402,9 +1410,11 @@ async function renderTextToPngsUncached(
       ? slotLines.slice(slotCursor, slotCursor + page.length).join('\n')
       : undefined;
     slotCursor += page.length;
-    images.push(await renderChunkToPng(chunk, cols, style, maxHeightPx, slotChunk, true));
+    jobs.push({ chunk, slotChunk });
   }
-  return images;
+  return Promise.all(
+    jobs.map(({ chunk, slotChunk }) => renderChunkToPng(chunk, cols, style, maxHeightPx, slotChunk, true)),
+  );
 }
 
 export async function renderTextToPngs(

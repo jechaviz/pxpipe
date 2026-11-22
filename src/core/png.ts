@@ -17,6 +17,7 @@ const CRC_TABLE: Uint32Array = (() => {
 })();
 
 function crc32(bytes: Uint8Array): number {
+  if (customCrc32) return customCrc32(bytes) >>> 0;
   let c = 0xffffffff;
   for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]!) & 0xff]! ^ (c >>> 8);
   return (c ^ 0xffffffff) >>> 0;
@@ -58,21 +59,25 @@ function chunk(type: string, data: Uint8Array): Uint8Array {
 
 export type DeflateZlibFn = (input: Uint8Array) => Uint8Array | Promise<Uint8Array>;
 export type BytesToBase64Fn = (bytes: Uint8Array) => string;
+export type Crc32Fn = (bytes: Uint8Array) => number;
 
 let customDeflateZlib: DeflateZlibFn | null = null;
 let customBytesToBase64: BytesToBase64Fn | null = null;
+let customCrc32: Crc32Fn | null = null;
 
 /**
- * Optional host hook to accelerate PNG deflate / base64 on runtimes like Node
- * (`node:zlib` deflateSync) without importing Node built-ins into the Worker-safe
- * core module. Pass `null` to restore the portable Web Streams / btoa defaults.
+ * Optional host hook to accelerate PNG deflate / CRC32 / base64 on runtimes
+ * like Node (`node:zlib` async deflate + hardware crc32) without importing Node
+ * built-ins into the Worker-safe core module. Pass `null` to restore defaults.
  */
 export function configurePngRuntime(opts: {
   deflateZlib?: DeflateZlibFn | null;
   bytesToBase64?: BytesToBase64Fn | null;
+  crc32?: Crc32Fn | null;
 }): void {
   if ('deflateZlib' in opts) customDeflateZlib = opts.deflateZlib ?? null;
   if ('bytesToBase64' in opts) customBytesToBase64 = opts.bytesToBase64 ?? null;
+  if ('crc32' in opts) customCrc32 = opts.crc32 ?? null;
 }
 
 // ---- Deflate via Web Streams (or registered host fast path) --------------
@@ -168,9 +173,17 @@ function packIndexedGray(pixels: Uint8Array, width: number, height: number): Ind
         if (idx) packed[dst + (x >> 2)]! |= idx << (6 - ((x & 3) << 1));
       }
     } else {
-      for (let x = 0; x < width; x++) {
-        const idx = lut[pixels[src + x]!]!;
-        if (idx) packed[dst + (x >> 1)]! |= idx << (4 - ((x & 1) << 2));
+      // Pack two 4-bit pixels per byte (single store instead of two RMW ops per pair).
+      const pairs = width & ~1;
+      for (let x = 0; x < pairs; x += 2) {
+        const hi = lut[pixels[src + x]!]!;
+        const lo = lut[pixels[src + x + 1]!]!;
+        const b = (hi << 4) | lo;
+        if (b) packed[dst + (x >> 1)] = b;
+      }
+      if (pairs < width) {
+        const hi = lut[pixels[src + pairs]!]!;
+        if (hi) packed[dst + (pairs >> 1)] = hi << 4;
       }
     }
   }

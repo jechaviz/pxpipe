@@ -17,9 +17,11 @@ import * as os from 'node:os';
 import { isIP } from 'node:net';
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-import { deflateSync } from 'node:zlib';
+import { promisify } from 'node:util';
+import * as zlib from 'node:zlib';
 import { configurePngRuntime } from './core/png.js';
 import {
+  configureProxyRuntime,
   createProxy,
   parseGatewayHeaders,
   resolveTrustAdjacentToolRoundsEnv,
@@ -1220,28 +1222,45 @@ async function loadSplitBlockPlugin(): Promise<SplitBlock | null> {
   return hook as SplitBlock;
 }
 
-function initNodePngFastPath(): void {
-  const raw = process.env.PXPIPE_PNG_DEFLATE_LEVEL?.trim();
-  if (raw && /^(off|web|stream)$/i.test(raw)) return;
-  let level = 1;
-  if (raw !== undefined && raw !== '') {
-    const parsed = Number(raw);
-    if (Number.isInteger(parsed) && parsed >= 0 && parsed <= 9) {
-      level = parsed;
-    } else {
-      console.warn(`[pxpipe] ignoring invalid PXPIPE_PNG_DEFLATE_LEVEL=${raw} (want 0-9 or off)`);
-    }
-  }
+const deflateAsync = promisify(zlib.deflate);
+const gzipAsync = promisify(zlib.gzip);
+
+function parseZlibLevel(envName: string, fallback: number): number | null {
+  const raw = process.env[envName]?.trim();
+  if (raw && /^(off|web|stream)$/i.test(raw)) return null;
+  if (raw === undefined || raw === '') return fallback;
+  const parsed = Number(raw);
+  if (Number.isInteger(parsed) && parsed >= 0 && parsed <= 9) return parsed;
+  console.warn(`[pxpipe] ignoring invalid ${envName}=${raw} (want 0-9 or off)`);
+  return fallback;
+}
+
+function initNodeCompressionFastPath(): void {
+  const pngLevel = parseZlibLevel('PXPIPE_PNG_DEFLATE_LEVEL', 1);
+  const nativeCrc32 = (zlib as { crc32?: (data: Uint8Array) => number }).crc32;
   configurePngRuntime({
-    deflateZlib: (input) => {
-      const out = deflateSync(input, { level });
-      return new Uint8Array(out.buffer, out.byteOffset, out.byteLength);
-    },
+    deflateZlib: pngLevel === null
+      ? null
+      : async (input) => {
+          const out = await deflateAsync(input, { level: pngLevel });
+          return new Uint8Array(out.buffer, out.byteOffset, out.byteLength);
+        },
+    crc32: typeof nativeCrc32 === 'function' ? (bytes) => nativeCrc32(bytes) >>> 0 : null,
+  });
+
+  const gzipLevel = parseZlibLevel('PXPIPE_GZIP_LEVEL', 3);
+  configureProxyRuntime({
+    gzipBytes: gzipLevel === null
+      ? null
+      : async (input) => {
+          const out = await gzipAsync(input, { level: gzipLevel });
+          return new Uint8Array(out.buffer, out.byteOffset, out.byteLength);
+        },
   });
 }
 
 async function main(): Promise<void> {
-  initNodePngFastPath();
+  initNodeCompressionFastPath();
   const argv = process.argv.slice(2);
   if (argv[0] === 'export') {
     await runExport(argv.slice(1));

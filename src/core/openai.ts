@@ -198,7 +198,12 @@ interface ResponsesRequest {
   [k: string]: unknown;
 }
 
-function responsesCacheBreakpoint(req: ResponsesRequest, profile: GptModelProfile): Record<string, unknown> {
+function responsesCacheBreakpoint(
+  req: ResponsesRequest,
+  profile: GptModelProfile,
+  disableCacheBreakpoints = false,
+): Record<string, unknown> {
+  if (disableCacheBreakpoints) return {};
   const mode = (req.prompt_cache_options as { mode?: string } | undefined)?.mode;
   return profile.cacheBreakpoints && (mode === undefined || mode === 'implicit')
     ? { prompt_cache_breakpoint: { mode: 'explicit' } }
@@ -975,6 +980,7 @@ async function applyResponsesHistoryCollapse(
   info: TransformInfo,
   o: OpenAIResolvedOptions,
   profile: GptModelProfile,
+  disableCacheBreakpoints = false,
 ): Promise<boolean> {
   const historySheets = createHistoryFactSheetRenderer(profile);
   const renderHistorySheet = historySheets.render;
@@ -1059,7 +1065,7 @@ async function applyResponsesHistoryCollapse(
         for (const token of extractFactSheetTokens(sheet)) coveredSheetTokens.add(token);
       }
     }
-    content.push({ type: 'input_text', text: outro, ...responsesCacheBreakpoint(req, profile) });
+    content.push({ type: 'input_text', text: outro, ...responsesCacheBreakpoint(req, profile, disableCacheBreakpoints) });
     info.nativeInjectedTokens = (info.nativeInjectedTokens ?? 0)
       + gptTextTokens(intro + sheet + outro);
     replacements.set(segment.insertAt, { role: 'user', content });
@@ -1422,7 +1428,7 @@ export async function transformOpenAIResponses(
   const finishHistoryOnly = async (reason: string) => {
     info.reason = reason;
     if (o.collapseHistory && !inputWasString && await applyResponsesHistoryCollapse(
-      req, inputItems, info, o, profile,
+      req, inputItems, info, o, profile, Boolean(opts.disableCacheBreakpoints),
     )) {
       info.reason = undefined;
       return finishSerialized();
@@ -1513,7 +1519,7 @@ export async function transformOpenAIResponses(
   info.imageSourceTexts = images.map(() => info.imageSourceText);
 
   const imagePartsResp: ResponsesInputImagePart[] = images.map((img) => responsesImagePart(img, req.model));
-  const endMarker: ResponsesInputTextPart = { type: 'input_text', text: '[End of rendered GPT system/tool context.]', ...responsesCacheBreakpoint(req, profile) };
+  const endMarker: ResponsesInputTextPart = { type: 'input_text', text: '[End of rendered GPT system/tool context.]', ...responsesCacheBreakpoint(req, profile, Boolean(opts.disableCacheBreakpoints)) };
   // Verbatim fact-sheet (see src/core/factsheet.ts): exact tokens that survive OCR loss.
   const slabFactSheet = factSheetText(combinedRaw, profile.factSheetFormat);
   const slabFactSheetPart: ResponsesInputTextPart[] = slabFactSheet
@@ -1582,7 +1588,7 @@ export async function transformOpenAIResponses(
   // The profile selects pair-only legacy coverage or mixed safe-message coverage;
   // both preserve recent/open/malformed calls and opaque protocol barriers.
   if (o.collapseHistory && !inputWasString) {
-    await applyResponsesHistoryCollapse(req, inputItems, info, o, profile);
+    await applyResponsesHistoryCollapse(req, inputItems, info, o, profile, Boolean(opts.disableCacheBreakpoints));
   }
 
   if (rewrittenTools !== undefined) req.tools = rewrittenTools;

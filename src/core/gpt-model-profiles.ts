@@ -620,7 +620,7 @@ function parseEnvProfiles(raw: string): Map<string, GptModelProfile> {
       vision: isValidVision(p.vision) ? p.vision : base.vision,
       cacheReadRate: rate(p.cacheReadRate, base.cacheReadRate),
       cacheWriteRate: rate(p.cacheWriteRate, base.cacheWriteRate ?? 1),
-      cacheBreakpoints: base.cacheBreakpoints,
+      cacheBreakpoints: typeof p.cacheBreakpoints === 'boolean' ? p.cacheBreakpoints : base.cacheBreakpoints,
       outputRate: rate(p.outputRate, base.outputRate),
       stripCols: posInt(p.stripCols, base.stripCols),
       maxHeightPx: posInt(p.maxHeightPx, base.maxHeightPx),

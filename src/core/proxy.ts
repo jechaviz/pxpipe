@@ -1937,7 +1937,12 @@ let responseContentType: string | undefined;
                   })
             : isOpenAIChat
               ? await transformOpenAIChatCompletions(bodyIn, effectiveOpts)
-              : await transformOpenAIResponses(bodyIn, effectiveOpts);
+              : await transformOpenAIResponses(
+                  bodyIn,
+                  isChatGPTCodexPath(url.pathname)
+                    ? { ...effectiveOpts, disableCacheBreakpoints: true }
+                    : effectiveOpts,
+                );
         transformMs = Date.now() - tTransform;
         // Cloud Code PA (/v1internal:*) does not accept the Gemini Developer API :countTokens
         // payload shapes; probing it blocks every compressed turn for up to COUNT_TOKENS_TIMEOUT_MS

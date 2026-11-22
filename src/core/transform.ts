@@ -92,6 +92,8 @@ export interface TransformOptions {
   claudeCodeSessionId?: string;
   /** Master switch — false makes this a no-op pass-through. */
   compress?: boolean;
+  /** Omit explicit `prompt_cache_breakpoint` fields on OpenAI Responses (required for ChatGPT Codex upstream, #357). */
+  disableCacheBreakpoints?: boolean;
   /** Move tool descriptions into the same image (and stub the originals). */
   compressTools?: boolean;
   /** Compress large tool_result text content across all user messages. */
@@ -182,6 +184,7 @@ const DEFAULTS: Required<TransformOptions> = {
   emitRecoverable: false,
   splitBlock: null,
   // GPT-only knobs; the Anthropic transform ignores them but Required<> needs them.
+  disableCacheBreakpoints: false,
   collapseHistory: true,
   gptHistory: {},
   model: '',

@@ -10,6 +10,8 @@ import {
   READABLE_CHARS_PER_IMAGE,
   neutralizeSentinel,
   reflow,
+  registerRenderCacheClearHook,
+  renderCacheMaxBytes,
   renderTextToPngs,
   shrinkColsToContent,
   type RenderedImage,
@@ -237,6 +239,52 @@ function safeJson(value: unknown): string {
   }
 }
 
+const GOOGLE_TOOL_CACHE_CAP = 32;
+const GOOGLE_SLAB_CACHE_CAP = 32;
+const GOOGLE_CHUNK_CACHE_CAP = 256;
+const GOOGLE_HIST_SHA_CACHE_CAP = 64;
+
+interface CachedGoogleStaticSlab {
+  staticImages: RenderedImage[];
+  imageTokens: number;
+  textTokens: number;
+  nativeInjectedTokens: number;
+  fsText: string | null;
+  renderedText: string;
+  systemSha8: string;
+  profitable: boolean;
+}
+
+const googleToolRewriteCache = new Map<string, GoogleToolRewrite>();
+const googleStaticSlabCache = new Map<string, CachedGoogleStaticSlab>();
+const googleSealedChunkCache = new Map<string, GoogleHistoryChunk>();
+const googleHistoryShaCache = new Map<string, string>();
+
+registerRenderCacheClearHook(() => {
+  googleToolRewriteCache.clear();
+  googleStaticSlabCache.clear();
+  googleSealedChunkCache.clear();
+  googleHistoryShaCache.clear();
+});
+
+function lruGet<V>(map: Map<string, V>, key: string): V | undefined {
+  const val = map.get(key);
+  if (val !== undefined) {
+    map.delete(key);
+    map.set(key, val);
+  }
+  return val;
+}
+
+function lruSet<V>(map: Map<string, V>, key: string, val: V, cap: number): void {
+  if (map.has(key)) map.delete(key);
+  else if (map.size >= cap) {
+    const oldest = map.keys().next().value;
+    if (oldest !== undefined) map.delete(oldest);
+  }
+  map.set(key, val);
+}
+
 function googleTextTokens(text: string): number {
   return text ? Math.ceil(text.length / 3.5) : 0;
 }
@@ -245,7 +293,12 @@ function rewriteGoogleTools(tools: unknown[] | undefined): GoogleToolRewrite {
   if (!Array.isArray(tools) || tools.length === 0) {
     return { tools, docs: '', originalTokens: 0, rewrittenTokens: 0 };
   }
-  const originalTokens = googleTextTokens(safeJson(tools));
+  const rawJson = safeJson(tools);
+  if (renderCacheMaxBytes() > 0) {
+    const cached = lruGet(googleToolRewriteCache, rawJson);
+    if (cached !== undefined) return cached;
+  }
+  const originalTokens = googleTextTokens(rawJson);
   const docs: string[] = [];
   let changed = false;
   const rewritten = tools.map((rawTool) => {
@@ -279,12 +332,16 @@ function rewriteGoogleTools(tools: unknown[] | undefined): GoogleToolRewrite {
     return { ...tool, functionDeclarations: declarations };
   });
   const toolsOut = changed ? rewritten : tools;
-  return {
+  const result: GoogleToolRewrite = {
     tools: toolsOut,
     docs: docs.join('\n\n'),
     originalTokens,
     rewrittenTokens: googleTextTokens(safeJson(toolsOut)),
   };
+  if (renderCacheMaxBytes() > 0) {
+    lruSet(googleToolRewriteCache, rawJson, result, GOOGLE_TOOL_CACHE_CAP);
+  }
+  return result;
 }
 
 const SIMPLE_RESPONSE_KEYS = new Set(['name', 'output', 'content', 'result', 'error']);
@@ -705,6 +762,23 @@ async function planGoogleHistory(
     while (candidateEnd > cursor) {
       const chunk = selected.slice(cursor, candidateEnd);
       const chunkText = chunk.map((unit) => unit.text).filter(Boolean).join('\n\n');
+      const chunkKey = `${modelName}\x00${reflowEnabled ? 1 : 0}\x00${chunkText}`;
+      const cachedChunk = renderCacheMaxBytes() > 0
+        ? lruGet(googleSealedChunkCache, chunkKey)
+        : undefined;
+      if (cachedChunk !== undefined) {
+        if (cachedChunk.images.length > 0 && cachedChunk.images.length <= remaining) {
+          chunks.push(cachedChunk);
+          admitted.push(...chunk);
+          images.push(...cachedChunk.images);
+          imageSources.push(...cachedChunk.imageSources);
+          cursor = candidateEnd;
+          accepted = true;
+          break;
+        }
+        candidateEnd = googleClosedBoundary(selected, cursor, candidateEnd - 1) + 1;
+        continue;
+      }
       const safe = neutralizeSentinel(chunkText);
       const renderedText = reflowEnabled ? reflow(safe) ?? safe : safe;
       const chunkImages = await renderTextToPngs(
@@ -716,12 +790,16 @@ async function planGoogleHistory(
       if (chunkImages.length > 0 && chunkImages.length <= remaining) {
         const chunkFactSheet = factSheetText(chunkText, profile.factSheetFormat) ?? '';
         const chunkImageSources = chunkImages.map(() => chunkText);
-        chunks.push({
+        const sealedChunk: GoogleHistoryChunk = {
           images: chunkImages,
           imageSources: chunkImageSources,
           text: chunkText,
           factSheet: chunkFactSheet,
-        });
+        };
+        if (renderCacheMaxBytes() > 0) {
+          lruSet(googleSealedChunkCache, chunkKey, sealedChunk, GOOGLE_CHUNK_CACHE_CAP);
+        }
+        chunks.push(sealedChunk);
         admitted.push(...chunk);
         images.push(...chunkImages);
         imageSources.push(...chunkImageSources);
@@ -732,6 +810,27 @@ async function planGoogleHistory(
       candidateEnd = googleClosedBoundary(selected, cursor, candidateEnd - 1) + 1;
     }
     if (!accepted) break;
+  }
+
+  // Background speculative pre-warming: while the request streams upstream,
+  // pre-warm fact-sheet extraction on the unsealed trailing remainder so when
+  // the next turn crosses GOOGLE_CHUNK_SEAL_CHARS it is already hot in cache.
+  if (renderCacheMaxBytes() > 0 && cursor < selected.length) {
+    const trailingUnits = selected.slice(cursor);
+    if (trailingUnits.length >= 2) {
+      const trailingText = trailingUnits.map((u) => u.text).filter(Boolean).join('\n\n');
+      if (trailingText.length >= 2000) {
+        const fmt = profile.factSheetFormat;
+        const timer = setTimeout(() => {
+          try {
+            factSheetText(trailingText, fmt);
+          } catch {
+            /* best effort */
+          }
+        }, 0);
+        timer.unref?.();
+      }
+    }
   }
 
   if (admitted.length < 4 || images.length === 0) return null;
@@ -1001,43 +1100,83 @@ export async function transformGoogleGenerateContent(
   }
 
   if (combinedRaw) {
-    const combined = compactSlabWhitespace(combinedRaw).trimEnd();
-    info.systemSha8 = await sha8(combined);
-    const reflowNote = options.reflow !== false
-      ? ' The glyph ↵ (U+21B5) marks an original hard line break in content; treat it as a real newline.'
-      : '';
-    const header = CHAT_HEADER.replace('\n====', reflowNote + '\n====');
-    renderedText = prepareImagedRenderText(header + combined, options.reflow !== false);
+    const slabKey = `${modelName}\x00${options.reflow !== false ? 1 : 0}\x00${options.cols ?? ''}\x00${combinedRaw}`;
+    const cachedSlab = renderCacheMaxBytes() > 0
+      ? lruGet(googleStaticSlabCache, slabKey)
+      : undefined;
+    if (cachedSlab !== undefined) {
+      staticImages = cachedSlab.staticImages;
+      imageTokens = cachedSlab.imageTokens;
+      textTokens = cachedSlab.textTokens;
+      nativeInjectedTokens = cachedSlab.nativeInjectedTokens;
+      fsText = cachedSlab.fsText;
+      renderedText = cachedSlab.renderedText;
+      info.systemSha8 = cachedSlab.systemSha8;
+      staticProfitable = cachedSlab.profitable;
+      info.gateEval = {
+        site: 'slab',
+        imageTokens,
+        textTokens,
+        burnImageSide: nativeInjectedTokens,
+        burnTextSide: 0,
+        profitable: staticProfitable,
+      };
+    } else {
+      const combined = compactSlabWhitespace(combinedRaw).trimEnd();
+      info.systemSha8 = await sha8(combined);
+      const reflowNote = options.reflow !== false
+        ? ' The glyph ↵ (U+21B5) marks an original hard line break in content; treat it as a real newline.'
+        : '';
+      const header = CHAT_HEADER.replace('\n====', reflowNote + '\n====');
+      renderedText = prepareImagedRenderText(header + combined, options.reflow !== false);
 
-    const maxCols = options.cols ?? profile.stripCols;
-    const cols = Math.min(
-      shrinkColsToContent(renderedText, maxCols, profile.style.markerScale, profile.style.font),
-      profile.stripCols,
-    );
+      const maxCols = options.cols ?? profile.stripCols;
+      const cols = Math.min(
+        shrinkColsToContent(renderedText, maxCols, profile.style.markerScale, profile.style.font),
+        profile.stripCols,
+      );
 
-    staticImages = await renderTextToPngs(renderedText, cols, profile.style, profile.maxHeightPx);
-    imageTokens = staticImages.reduce(
-      (total, image) => total + geminiVisionTokens(modelName, image.width, image.height),
-      0,
-    );
-    textTokens = Math.max(
-      1,
-      googleTextTokens(authorityText)
-        + Math.max(0, toolRewrite.originalTokens - toolRewrite.rewrittenTokens),
-    );
-    fsText = factSheetText(combinedRaw, profile.factSheetFormat);
-    const nativeText = SYSTEM_POINTER + (fsText ?? '');
-    nativeInjectedTokens = Math.ceil(nativeText.length / 3.5);
+      staticImages = await renderTextToPngs(renderedText, cols, profile.style, profile.maxHeightPx);
+      imageTokens = staticImages.reduce(
+        (total, image) => total + geminiVisionTokens(modelName, image.width, image.height),
+        0,
+      );
+      textTokens = Math.max(
+        1,
+        googleTextTokens(authorityText)
+          + Math.max(0, toolRewrite.originalTokens - toolRewrite.rewrittenTokens),
+      );
+      fsText = factSheetText(combinedRaw, profile.factSheetFormat);
+      const nativeText = SYSTEM_POINTER + (fsText ?? '');
+      nativeInjectedTokens = Math.ceil(nativeText.length / 3.5);
 
-    info.gateEval = {
-      site: 'slab',
-      imageTokens,
-      textTokens,
-      burnImageSide: nativeInjectedTokens,
-      burnTextSide: 0,
-      profitable: imageTokens + nativeInjectedTokens < textTokens,
-    };
-    staticProfitable = info.gateEval.profitable;
+      info.gateEval = {
+        site: 'slab',
+        imageTokens,
+        textTokens,
+        burnImageSide: nativeInjectedTokens,
+        burnTextSide: 0,
+        profitable: imageTokens + nativeInjectedTokens < textTokens,
+      };
+      staticProfitable = info.gateEval.profitable;
+      if (renderCacheMaxBytes() > 0 && info.systemSha8) {
+        lruSet(
+          googleStaticSlabCache,
+          slabKey,
+          {
+            staticImages,
+            imageTokens,
+            textTokens,
+            nativeInjectedTokens,
+            fsText,
+            renderedText,
+            systemSha8: info.systemSha8,
+            profitable: staticProfitable,
+          },
+          GOOGLE_SLAB_CACHE_CAP,
+        );
+      }
+    }
   }
 
   // Build static image parts if static slab is profitable
@@ -1198,9 +1337,20 @@ export async function transformGoogleGenerateContent(
   }
 
   if (historyPlan && historyPlan.images.length > 0) {
-    info.historyImageSha = await sha8(
-      historyPlan.images.map((image) => image.base64 ?? bytesToBase64(image.png)).join(''),
-    );
+    const shaKey = `${modelName}\x00${historyPlan.chunks.length}\x00${historyPlan.images.length}\x00${historyPlan.text}`;
+    const cachedSha = renderCacheMaxBytes() > 0
+      ? lruGet(googleHistoryShaCache, shaKey)
+      : undefined;
+    if (cachedSha !== undefined) {
+      info.historyImageSha = cachedSha;
+    } else {
+      info.historyImageSha = await sha8(
+        historyPlan.images.map((image) => image.base64 ?? bytesToBase64(image.png)).join(''),
+      );
+      if (renderCacheMaxBytes() > 0) {
+        lruSet(googleHistoryShaCache, shaKey, info.historyImageSha, GOOGLE_HIST_SHA_CACHE_CAP);
+      }
+    }
   }
   const totalPixels = info.imageDims.reduce((sum, d) => sum + d.width * d.height, 0);
   if (totalPixels > 0) {

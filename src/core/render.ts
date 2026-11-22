@@ -78,7 +78,7 @@ import {
   atlasGrayRank as jbMono14GrayRank,
 } from './atlas-gray-jbmono14.js';
 import { clearFactSheetCache } from './factsheet.js';
-import { bytesToBase64, encodeGrayPng, encodeRgbPng } from './png.js';
+import { bytesToBase64, encodeGrayPng, encodeRgbPng, sha256Hex } from './png.js';
 
 export type RenderFont = 'spleen-5x8' | 'jetbrains-mono-10' | 'jetbrains-mono-12' | 'jetbrains-mono-14';
 export const DEFAULT_RENDER_FONT: RenderFont = 'spleen-5x8';
@@ -1262,6 +1262,13 @@ function evictToBudget(pinnedKey?: string): void {
   }
 }
 
+const renderCacheClearHooks: Array<() => void> = [];
+
+/** Register an auxiliary module-level cache clear callback for tests and idle sleep. */
+export function registerRenderCacheClearHook(fn: () => void): void {
+  renderCacheClearHooks.push(fn);
+}
+
 /** Drop every entry. Tests use this to isolate hit/miss accounting. */
 export function clearRenderCache(): void {
   renderCache.clear();
@@ -1271,6 +1278,7 @@ export function clearRenderCache(): void {
   renderCacheEvictions = 0;
   renderCacheOversized = 0;
   clearFactSheetCache();
+  for (const fn of renderCacheClearHooks) fn();
 }
 
 /**
@@ -1282,6 +1290,7 @@ export function evictRenderCacheForSleep(): number {
   renderCache.clear();
   renderCacheBytes = 0;
   clearFactSheetCache();
+  for (const fn of renderCacheClearHooks) fn();
   return freed;
 }
 
@@ -1350,11 +1359,7 @@ async function renderCacheKey(
     `${styleKey.length}|${styleKey}|` +
     `${slotLen}|${slotText ?? ''}|` +
     `${text.length}|${text}`;
-  const digest = await crypto.subtle.digest('SHA-256', renderCacheKeyEncoder.encode(canonical));
-  const bytes = new Uint8Array(digest);
-  let hex = '';
-  for (const b of bytes) hex += b.toString(16).padStart(2, '0');
-  return hex;
+  return sha256Hex(canonical);
 }
 
 export async function renderTextToPngsWithCharLimit(

@@ -47,6 +47,8 @@ export interface WarpHandlerOptions {
   ca: CertificateAuthority;
   /** Called the first time each route diverts a request, for the log. */
   onDivert?: (host: string, path: string, target: string) => void;
+  /** Called on any request or tunnel activity through the CONNECT proxy. */
+  onActivity?: () => void;
 }
 
 export interface WarpHandlers {
@@ -119,7 +121,7 @@ const httpAgent = new HttpAgent({ keepAlive: true });
 const httpsAgent = new HttpsAgent({ keepAlive: true });
 
 export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
-  const { routes, ca, onDivert } = options;
+  const { routes, ca, onDivert, onActivity } = options;
   const announced = new Set<string>();
 
   /** Re-originate one request, to a route target or to the real host. */
@@ -204,6 +206,7 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
   };
 
   const handleDecrypted = (req: IncomingMessage, res: ServerResponse): void => {
+    onActivity?.();
     const servername = (req.socket as TLSSocket).servername || '';
     // A client that CONNECTed to a non-443 port repeats it in Host, which is
     // the only place the original port survives the hijack into mitmServer.
@@ -219,6 +222,7 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
    * never produce a 101).
    */
   const handleUpgrade = (req: IncomingMessage, clientSocket: Socket, head: Buffer): void => {
+    onActivity?.();
     const servername = (req.socket as TLSSocket).servername || '';
     const { host, port } = splitHostPort(req.headers.host || servername, '443');
     const upstream = tlsConnect({ host, port: Number(port), servername: host }, () => {
@@ -254,7 +258,9 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
   mitmServer.on('clientError', (_err, socket) => socket.destroy());
 
   const handleConnect = (req: IncomingMessage, clientSocket: Socket, head: Buffer): void => {
+    onActivity?.();
     clientSocket.setNoDelay?.(true);
+    clientSocket.setKeepAlive?.(true, 30_000);
     if (!isLoopbackAddress(req.socket.remoteAddress)) {
       clientSocket.end('HTTP/1.1 403 Forbidden\r\n\r\n');
       return;
@@ -263,6 +269,7 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
 
     if (!hostCouldMatch(routes, authority(host, port))) {
       const upstream = netConnect({ host, port: Number(port) }, () => {
+        upstream.setKeepAlive?.(true, 30_000);
         clientSocket.write('HTTP/1.1 200 Connection established\r\n\r\n');
         if (head?.length) upstream.write(head);
         pipeSockets(clientSocket, upstream);

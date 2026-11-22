@@ -60,24 +60,41 @@ function chunk(type: string, data: Uint8Array): Uint8Array {
 export type DeflateZlibFn = (input: Uint8Array) => Uint8Array | Promise<Uint8Array>;
 export type BytesToBase64Fn = (bytes: Uint8Array) => string;
 export type Crc32Fn = (bytes: Uint8Array) => number;
+export type Sha256HexFn = (input: string | Uint8Array) => string | Promise<string>;
 
 let customDeflateZlib: DeflateZlibFn | null = null;
 let customBytesToBase64: BytesToBase64Fn | null = null;
 let customCrc32: Crc32Fn | null = null;
+let customSha256Hex: Sha256HexFn | null = null;
 
 /**
- * Optional host hook to accelerate PNG deflate / CRC32 / base64 on runtimes
- * like Node (`node:zlib` async deflate + hardware crc32) without importing Node
- * built-ins into the Worker-safe core module. Pass `null` to restore defaults.
+ * Optional host hook to accelerate PNG deflate / CRC32 / base64 / SHA-256 on runtimes
+ * like Node (`node:zlib` async deflate + hardware crc32 + `node:crypto` sha256) without
+ * importing Node built-ins into the Worker-safe core module. Pass `null` to restore defaults.
  */
 export function configurePngRuntime(opts: {
   deflateZlib?: DeflateZlibFn | null;
   bytesToBase64?: BytesToBase64Fn | null;
   crc32?: Crc32Fn | null;
+  sha256Hex?: Sha256HexFn | null;
 }): void {
   if ('deflateZlib' in opts) customDeflateZlib = opts.deflateZlib ?? null;
   if ('bytesToBase64' in opts) customBytesToBase64 = opts.bytesToBase64 ?? null;
   if ('crc32' in opts) customCrc32 = opts.crc32 ?? null;
+  if ('sha256Hex' in opts) customSha256Hex = opts.sha256Hex ?? null;
+}
+
+const sha256Encoder = new TextEncoder();
+
+/** Compute full 64-char hex SHA-256 digest using registered host fast path or WebCrypto fallback. */
+export async function sha256Hex(input: string | Uint8Array): Promise<string> {
+  if (customSha256Hex) return customSha256Hex(input);
+  const bytes = typeof input === 'string' ? sha256Encoder.encode(input) : input;
+  const digest = await crypto.subtle.digest('SHA-256', bytes as Uint8Array<ArrayBuffer>);
+  const out = new Uint8Array(digest);
+  let hex = '';
+  for (let i = 0; i < out.length; i++) hex += out[i]!.toString(16).padStart(2, '0');
+  return hex;
 }
 
 // ---- Deflate via Web Streams (or registered host fast path) --------------

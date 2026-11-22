@@ -46,7 +46,7 @@ import {
 import { factSheetText } from './factsheet.js';
 import { addSplitStats, bindSplitBlock, planSegments, SPLIT_MAX_IMAGE_SEGMENTS, type SplitBlock, type SplitCost, type SplitSegment } from './split-block.js';
 import { stripSchemaDescriptions, schemaHasStructure } from './schema-strip.js';
-import { bytesToBase64 } from './png.js';
+import { bytesToBase64, sha256Hex } from './png.js';
 import {
   collapseHistory,
   HISTORY_SYNTHETIC_INTRO,
@@ -1200,14 +1200,9 @@ function observeStaticTagChurn(
   return churned;
 }
 
-/** sha256[0..8] hex via Web Crypto (works in Node 18+ and Workers). 32-bit collision-safe. */
+/** sha256[0..8] hex via registered host fast path or Web Crypto fallback. 32-bit collision-safe. */
 export async function sha8(text: string): Promise<string> {
-  const buf = new TextEncoder().encode(text);
-  const digest = await crypto.subtle.digest('SHA-256', buf);
-  const bytes = new Uint8Array(digest);
-  let hex = '';
-  for (let i = 0; i < 4; i++) hex += bytes[i]!.toString(16).padStart(2, '0');
-  return hex;
+  return (await sha256Hex(text)).slice(0, 8);
 }
 
 /** Record a recovery entry when `emitRecoverable` is on. No-op (no hash cost) when off. */

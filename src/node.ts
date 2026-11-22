@@ -19,6 +19,7 @@ import { isIP, type Socket } from 'node:net';
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
+import { createHash } from 'node:crypto';
 import * as zlib from 'node:zlib';
 import { configurePngRuntime } from './core/png.js';
 import {
@@ -1275,6 +1276,7 @@ function initNodeCompressionFastPath(): void {
           return new Uint8Array(out.buffer, out.byteOffset, out.byteLength);
         },
     crc32: typeof nativeCrc32 === 'function' ? (bytes) => nativeCrc32(bytes) >>> 0 : null,
+    sha256Hex: (input) => createHash('sha256').update(input).digest('hex'),
   });
 
   const gzipLevel = parseZlibLevel('PXPIPE_GZIP_LEVEL', 3);
@@ -1782,12 +1784,14 @@ async function main(): Promise<void> {
     onDivert: (host, path, target) => {
       if (!process.stdout.isTTY) console.error(`[pxpipe] warp: ${host}${path} → ${target}`);
     },
+    onActivity: () => touchInferenceActivity(),
   });
 
   // Idle deep-sleep controller: when all IDEs/agents are closed or idle for
-  // PXPIPE_IDLE_SLEEP_MS (default 3 min), evict heavy in-memory caches, close
-  // idle sockets, run V8 GC, and disarm all timers so the process sits at 0% CPU
-  // in OS IOCP/epoll until the next inference request arrives.
+  // PXPIPE_IDLE_SLEEP_MS (default 3 min), evict heavy in-memory caches,
+  // run V8 GC, and disarm all timers so the process sits at 0% CPU in OS
+  // IOCP/epoll until the next inference request arrives. Keep CONNECT tunnels
+  // intact so persistent IDE language servers never see an unexpected reset.
   const rawIdleMs = process.env.PXPIPE_IDLE_SLEEP_MS?.trim();
   const idleSleepMs =
     rawIdleMs && /^(0|off|false|no)$/i.test(rawIdleMs)
@@ -1815,8 +1819,6 @@ async function main(): Promise<void> {
     const freedRenderBytes = evictRenderCacheForSleep();
     const { freedBytes: freedDashBytes } = dashboard.hibernate();
     const freedLeaves = warpCa.clearLeafCache();
-    warpHandlers.closeIdle();
-    server.closeIdleConnections?.();
     const gcFn = (globalThis as { gc?: () => void }).gc;
     if (typeof gcFn === 'function') {
       try {

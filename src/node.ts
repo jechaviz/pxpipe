@@ -10,6 +10,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { createWarpRuntime, defaultRoutes as defaultWarpRoutes } from './warp/index.js';
 import { CertificateAuthority } from './warp/ca.js';
 import { createWarpHandlers } from './warp/connect.js';
+import { parseRoute } from './warp/route.js';
 import { once } from 'node:events';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -371,6 +372,12 @@ Environment:
   PXPIPE_TRUST_ADJACENT_TOOL_ROUNDS  1 = let history collapse split adjacent
                           tool call/result pairs for every client; 0 = never.
                           Unset: on only for Claude Code (claude-cli/ UA + x-app: cli).
+  PXPIPE_PNG_DEFLATE_LEVEL  zlib deflate level for PNG encoding on Node (0-9,
+                          default 1; 'off' restores Web CompressionStream).
+  PXPIPE_GZIP_LEVEL       zlib gzip level for outbound JSON POST compression on
+                          Node (0-9, default 3; 'off' restores CompressionStream).
+  PXPIPE_WARP_ROUTES      comma-separated extra PATTERN=TARGET routes mounted on
+                          the main server's CONNECT proxy ahead of default routes.
   PXPIPE_DEBUG_CAPTURE_4XX  debug: set to 1 to persist full 4xx request and
                           upstream error bodies (prompts + any secrets in
                           context) to disk. Off by default.
@@ -1552,9 +1559,14 @@ async function main(): Promise<void> {
   };
   const handle = createProxy(config);
 
+  const extraWarpRoutes = (process.env.PXPIPE_WARP_ROUTES ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((spec) => parseRoute(spec));
   const warpCa = CertificateAuthority.loadOrCreate(path.join(os.homedir(), '.pxpipe'));
   const warpHandlers = createWarpHandlers({
-    routes: defaultWarpRoutes(opts.port),
+    routes: [...extraWarpRoutes, ...defaultWarpRoutes(opts.port)],
     ca: warpCa,
     onDivert: (host, path, target) => {
       if (!process.stdout.isTTY) console.error(`[pxpipe] warp: ${host}${path} → ${target}`);

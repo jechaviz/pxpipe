@@ -4,7 +4,7 @@ import { join } from 'node:path';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { isPathLike, isRunnable, whichSync } from '../src/warp/resolve.js';
+import { isPathLike, isRunnable, resolveWindowsCmdShim, whichSync } from '../src/warp/resolve.js';
 
 // Windows lookup is pure path logic (PATH delimiter, PATHEXT), so it can be
 // exercised on any host by passing the platform in explicitly.
@@ -47,6 +47,8 @@ describe('warp command resolution on win32', () => {
 
   it('does not report .cmd shims, which spawn() cannot launch directly', () => {
     expect(whichSync('codex', env(), 'win32')).toBe(false);
+    expect(resolveWindowsCmdShim('codex', env(), 'win32')).toBe(join(shims, 'codex.cmd'));
+    expect(resolveWindowsCmdShim('codex', env(), 'linux')).toBeNull();
   });
 
   it('treats backslash paths as paths', () => {

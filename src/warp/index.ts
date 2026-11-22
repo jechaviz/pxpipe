@@ -22,7 +22,7 @@ import { join } from 'node:path';
 
 import { CertificateAuthority } from './ca.js';
 import { createWarpHandlers } from './connect.js';
-import { isRunnable } from './resolve.js';
+import { isRunnable, resolveWindowsCmdShim } from './resolve.js';
 import { parseRoute, routeDestination, type Route } from './route.js';
 
 export interface WarpRuntimeOptions {
@@ -143,9 +143,17 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
       console.error(`[pxpipe] warp: ignoring stale alias ${command[0]} → ${aliasWord} (not executable)`);
     }
     if (!aliasUsable && isRunnable(command[0]!, env)) {
+      const winShim = resolveWindowsCmdShim(command[0]!, env);
+      if (winShim) {
+        return spawn(env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', winShim, ...command.slice(1)], direct);
+      }
       return spawn(command[0]!, command.slice(1), direct);
     }
     if (!shellUsable) {
+      const winShim = resolveWindowsCmdShim(command[0]!, env);
+      if (winShim) {
+        return spawn(env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', winShim, ...command.slice(1)], direct);
+      }
       // Let spawn() report the real ENOENT for the command itself rather
       // than a misleading one for a shell that was never there.
       return spawn(command[0]!, command.slice(1), direct);

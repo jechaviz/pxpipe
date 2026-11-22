@@ -3,6 +3,7 @@ import path from 'node:path';
 
 const DEFAULT_PATHEXT = '.COM;.EXE;.BAT;.CMD';
 const DIRECT_EXTS = new Set(['.com', '.exe']);
+const SHELL_SHIM_EXTS = new Set(['.cmd', '.bat']);
 
 /** Does this word name a file path rather than a bare command? */
 export const isPathLike = (word: string, platform: NodeJS.Platform = process.platform): boolean =>
@@ -57,3 +58,40 @@ export const isRunnable = (
   env: NodeJS.ProcessEnv,
   platform: NodeJS.Platform = process.platform,
 ): boolean => (isPathLike(word, platform) ? existsSync(word) : whichSync(word, env, platform));
+
+/**
+ * Resolve a Windows `.cmd` / `.bat` shim (such as npm-installed `claude.cmd` or
+ * `agy.cmd`) that `spawn()` cannot run without `cmd.exe`. Returns the full path
+ * when found, or `null` otherwise.
+ */
+export const resolveWindowsCmdShim = (
+  name: string,
+  env: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform = process.platform,
+): string | null => {
+  if (platform !== 'win32') return null;
+  const lower = name.toLowerCase();
+  if (isPathLike(name, platform)) {
+    return (lower.endsWith('.cmd') || lower.endsWith('.bat')) && existsSync(name) ? name : null;
+  }
+  const pathVar = env.PATH ?? env.Path ?? '';
+  const exts = (env.PATHEXT ?? DEFAULT_PATHEXT)
+    .split(';')
+    .map((ext) => ext.toLowerCase())
+    .filter((ext) => SHELL_SHIM_EXTS.has(ext));
+  const hasExt = exts.some((ext) => lower.endsWith(ext));
+  const candidates = hasExt ? [name] : exts.map((ext) => name + ext);
+  for (const dir of pathVar.split(path.win32.delimiter)) {
+    if (!dir) continue;
+    for (const candidate of candidates) {
+      const full = path.join(dir, candidate);
+      try {
+        accessSync(full, constants.F_OK);
+        return full;
+      } catch {
+        // not here, keep looking
+      }
+    }
+  }
+  return null;
+};

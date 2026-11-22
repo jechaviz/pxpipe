@@ -1261,6 +1261,17 @@ export function clearRenderCache(): void {
   renderCacheOversized = 0;
 }
 
+/**
+ * Evict all cached rendered pages during idle sleep to return memory to the OS,
+ * while preserving lifetime hit/miss/eviction counters for `/proxy-stats`.
+ */
+export function evictRenderCacheForSleep(): number {
+  const freed = renderCacheBytes;
+  renderCache.clear();
+  renderCacheBytes = 0;
+  return freed;
+}
+
 /** Stable serialization of RenderStyle. Every field is a primitive (see the interface),
  *  so String() is unambiguous; sorting keys removes any dependence on literal order.
  *  Undefined values are skipped so `{}` and `{aa: undefined}` share one entry. */

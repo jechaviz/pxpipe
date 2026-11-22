@@ -15,7 +15,7 @@ import { once } from 'node:events';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { isIP } from 'node:net';
+import { isIP, type Socket } from 'node:net';
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
@@ -57,6 +57,7 @@ import {
 } from './dashboard.js';
 import { runStats } from './stats.js';
 import type { SplitBlock } from './core/split-block.js';
+import { evictRenderCacheForSleep } from './core/render.js';
 
 /** Runtime config. The core transform tuning comes from DEFAULTS in
  *  transform.ts; startup knobs cover deployment plus emergency GPT scope
@@ -378,6 +379,11 @@ Environment:
                           Node (0-9, default 3; 'off' restores CompressionStream).
   PXPIPE_WARP_ROUTES      comma-separated extra PATTERN=TARGET routes mounted on
                           the main server's CONNECT proxy ahead of default routes.
+  PXPIPE_IDLE_SLEEP_MS    inactivity timeout (ms) after which pxpipe enters deep
+                          sleep (flushes session state, evicts render/dashboard/TLS
+                          caches, closes idle sockets, runs V8 GC, and disarms all
+                          timers until the next inference request; default 180000,
+                          0/off disables).
   PXPIPE_DEBUG_CAPTURE_4XX  debug: set to 1 to persist full 4xx request and
                           upstream error bodies (prompts + any secrets in
                           context) to disk. Off by default.
@@ -1573,10 +1579,70 @@ async function main(): Promise<void> {
     },
   });
 
+  // Idle deep-sleep controller: when all IDEs/agents are closed or idle for
+  // PXPIPE_IDLE_SLEEP_MS (default 3 min), evict heavy in-memory caches, close
+  // idle sockets, run V8 GC, and disarm all timers so the process sits at 0% CPU
+  // in OS IOCP/epoll until the next inference request arrives.
+  const rawIdleMs = process.env.PXPIPE_IDLE_SLEEP_MS?.trim();
+  const idleSleepMs =
+    rawIdleMs && /^(0|off|false|no)$/i.test(rawIdleMs)
+      ? 0
+      : rawIdleMs && Number.isFinite(Number(rawIdleMs)) && Number(rawIdleMs) > 0
+        ? Math.floor(Number(rawIdleMs))
+        : 180_000;
+  let isSleeping = true;
+  let activeInferenceRequests = 0;
+  let idleSleepTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const enterIdleSleep = (): void => {
+    idleSleepTimer = undefined;
+    if (activeInferenceRequests > 0) {
+      scheduleIdleSleep();
+      return;
+    }
+    if (isSleeping) return;
+    isSleeping = true;
+    try {
+      flushSessionState();
+    } catch {
+      /* best effort */
+    }
+    const freedRenderBytes = evictRenderCacheForSleep();
+    const { freedBytes: freedDashBytes } = dashboard.hibernate();
+    const freedLeaves = warpCa.clearLeafCache();
+    warpHandlers.closeIdle();
+    server.closeIdleConnections?.();
+    const gcFn = (globalThis as { gc?: () => void }).gc;
+    if (typeof gcFn === 'function') {
+      try {
+        gcFn();
+      } catch {
+        /* ignore */
+      }
+    }
+    const totalFreedKb = Math.round((freedRenderBytes + freedDashBytes) / 1024);
+    if (totalFreedKb > 0 || freedLeaves > 0) {
+      console.log(`[pxpipe] idle sleep — freed ${totalFreedKb} KiB cache + ${freedLeaves} TLS contexts (0 timers active)`);
+    }
+  };
+
+  function scheduleIdleSleep(): void {
+    if (idleSleepMs <= 0) return;
+    if (idleSleepTimer !== undefined) clearTimeout(idleSleepTimer);
+    idleSleepTimer = setTimeout(enterIdleSleep, idleSleepMs);
+    idleSleepTimer.unref?.();
+  }
+
+  const touchInferenceActivity = (): void => {
+    isSleeping = false;
+    scheduleIdleSleep();
+  };
+
   const server = createServer((req, res) => {
     req.socket?.setNoDelay?.(true);
     // Forward proxy requests (absolute URL form: GET http://...)
     if (req.url && (req.url.startsWith('http://') || req.url.startsWith('https://'))) {
+      touchInferenceActivity();
       warpHandlers.handleAbsoluteForm(req, res);
       return;
     }
@@ -1602,13 +1668,20 @@ async function main(): Promise<void> {
             return;
           }
         }
-        const webReq = toWebRequest(req);
-        const webRes = await handle(webReq);
-        // If the handler answered without draining the request body (e.g. an
-        // early 413), close the keep-alive socket after flushing the response
-        // so unread body bytes cannot desync the next pipelined request.
-        if (!req.complete && !res.headersSent) res.setHeader('connection', 'close');
-        await writeWebResponse(webRes, res);
+        touchInferenceActivity();
+        activeInferenceRequests++;
+        try {
+          const webReq = toWebRequest(req);
+          const webRes = await handle(webReq);
+          // If the handler answered without draining the request body (e.g. an
+          // early 413), close the keep-alive socket after flushing the response
+          // so unread body bytes cannot desync the next pipelined request.
+          if (!req.complete && !res.headersSent) res.setHeader('connection', 'close');
+          await writeWebResponse(webRes, res);
+        } finally {
+          activeInferenceRequests = Math.max(0, activeInferenceRequests - 1);
+          touchInferenceActivity();
+        }
       })
       .catch((err) => {
         if (isConnectionAbort(err) && (req.aborted || res.destroyed)) return;
@@ -1618,7 +1691,10 @@ async function main(): Promise<void> {
       });
   });
   server.on('connection', (socket) => socket.setNoDelay(true));
-  server.on('connect', warpHandlers.handleConnect);
+  server.on('connect', (req, socket, head) => {
+    touchInferenceActivity();
+    warpHandlers.handleConnect(req, socket as Socket, head);
+  });
   // IPv6 literals need bracket notation to form a valid URL (http://[::1]:47821).
   const displayHost = opts.host.includes(':') ? `[${opts.host}]` : opts.host;
   const announce = () => {

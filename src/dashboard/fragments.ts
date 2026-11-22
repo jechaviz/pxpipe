@@ -1278,7 +1278,7 @@ export function renderPage(port: number, hostLabel = ''): string {
   </div>
   <div class="controls">
     <button type="button" id="theme-btn" class="theme-btn" onclick="ppTheme()" aria-label="Toggle dark mode" title="Toggle dark / light mode">☾ Dark</button>
-    <div id="frag-toggle" hx-get="/fragments/toggle" hx-trigger="load, every 2s" hx-swap="innerHTML"></div>
+    <div id="frag-toggle" hx-get="/fragments/toggle" hx-trigger="load, every 2s [!document.hidden], visibilitychange[!document.hidden] from:document" hx-swap="innerHTML"></div>
   </div>
 </header>
 
@@ -1300,7 +1300,7 @@ pxpipe warp -- cursor-agent</pre>
 <details class="models-collapse">
   <summary class="models-summary">Image model scope <span class="hint">Fable 5, Gemini 3.6 Flash, and Gemini 3.7 Flash by default · expand to experiment with other families</span></summary>
   <div class="models-warning">⚠ Image compression is validated for Fable 5, Gemini 3.6 Flash, and Gemini 3.7 Flash — other families can use <strong>more</strong> tokens, not less. Opt in only for deliberate experiments.</div>
-  <div id="frag-models" hx-get="/fragments/models" hx-trigger="load, every 2s [!document.activeElement || document.activeElement.id !== 'models-csv']" hx-swap="innerHTML"></div>
+  <div id="frag-models" hx-get="/fragments/models" hx-trigger="load, every 2s [!document.hidden && (!document.activeElement || document.activeElement.id !== 'models-csv')], visibilitychange[!document.hidden] from:document" hx-swap="innerHTML"></div>
   <div class="models-routing"><span class="hint">imaging scope ≠ provider routing — non-Anthropic IDs also need routing env on the proxy</span> <button class="mini-btn" type="button" onclick="document.getElementById('routing-help').showModal()">routing help</button></div>
 </details>
 
@@ -1324,24 +1324,24 @@ npx pxpipe-proxy</pre>
   <button class="mini-btn" type="button" onclick="this.closest('dialog').close()">close</button>
 </dialog>
 
-<div id="frag-session" hx-get="/fragments/session-summary" hx-trigger="load, every 2s" hx-swap="innerHTML">
+<div id="frag-session" hx-get="/fragments/session-summary" hx-trigger="load, every 2s [!document.hidden], visibilitychange[!document.hidden] from:document" hx-swap="innerHTML">
   <div class="hero hero-empty"><div class="hero-headline">Connecting…</div></div>
 </div>
 
-<div id="frag-header" hx-get="/fragments/header" hx-trigger="load, every 2s" hx-swap="innerHTML"></div>
+<div id="frag-header" hx-get="/fragments/header" hx-trigger="load, every 2s [!document.hidden], visibilitychange[!document.hidden] from:document" hx-swap="innerHTML"></div>
 
 <section class="section">
   <h2 class="section-head">What happened to your context <span class="section-sub">click a request to see image vs text</span></h2>
   <div class="xray">
     <div class="card">
       <h3 class="card-head">Recent requests</h3>
-      <div id="frag-recent" hx-get="/fragments/recent" hx-trigger="load, every 2s" hx-swap="innerHTML"></div>
+      <div id="frag-recent" hx-get="/fragments/recent" hx-trigger="load, every 2s [!document.hidden], visibilitychange[!document.hidden] from:document" hx-swap="innerHTML"></div>
     </div>
     <div class="card">
       <h3 class="card-head">Image vs text breakdown</h3>
       <div id="frag-context-map" hx-get="/fragments/context-map" hx-trigger="load" hx-swap="innerHTML"></div>
       <h3 class="card-head spaced">Image ↔ source inspector</h3>
-      <div id="frag-latest" hx-get="/fragments/latest" hx-trigger="load, every 2s, pp-refresh" hx-swap="innerHTML"
+      <div id="frag-latest" hx-get="/fragments/latest" hx-trigger="load, every 2s [!document.hidden], visibilitychange[!document.hidden] from:document, pp-refresh" hx-swap="innerHTML"
            hx-vals='js:{pin: window.pp.pin == null ? "" : window.pp.pin, source: window.pp.src ? "1" : ""}'></div>
     </div>
   </div>
@@ -1350,14 +1350,14 @@ npx pxpipe-proxy</pre>
 <section class="section">
   <h2 class="section-head">Top sessions <span class="section-sub">by tokens saved</span></h2>
   <div class="card">
-    <div id="frag-sessions" hx-get="/fragments/sessions" hx-trigger="load, every 5s" hx-swap="innerHTML"></div>
+    <div id="frag-sessions" hx-get="/fragments/sessions" hx-trigger="load, every 5s [!document.hidden], visibilitychange[!document.hidden] from:document" hx-swap="innerHTML"></div>
   </div>
 </section>
 
 <section class="section">
   <h2 class="section-head">Full history <span class="section-sub">every event on disk</span></h2>
   <div class="card">
-    <div id="frag-stats" hx-get="/fragments/stats" hx-trigger="load, every 5s" hx-swap="innerHTML"></div>
+    <div id="frag-stats" hx-get="/fragments/stats" hx-trigger="load, every 5s [!document.hidden], visibilitychange[!document.hidden] from:document" hx-swap="innerHTML"></div>
   </div>
 </section>
 

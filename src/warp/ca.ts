@@ -350,4 +350,11 @@ export class CertificateAuthority {
     this.leaves.set(name, context);
     return context;
   }
+
+  /** Evict cached per-host TLS SecureContexts during idle sleep; re-minted on demand. */
+  clearLeafCache(): number {
+    const count = this.leaves.size;
+    this.leaves.clear();
+    return count;
+  }
 }

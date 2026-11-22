@@ -54,6 +54,8 @@ export interface WarpHandlers {
   handleConnect: (req: IncomingMessage, socket: Socket, head: Buffer) => void;
   /** Call from the request handler for absolute-form request targets. */
   handleAbsoluteForm: (req: IncomingMessage, res: ServerResponse) => void;
+  /** Destroy idle keep-alive sockets in the forward-proxy agent pools during sleep. */
+  closeIdle: () => void;
 }
 
 /**
@@ -311,5 +313,10 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
     forward(req, res, hostPort, target.pathname + target.search, target.origin);
   };
 
-  return { handleConnect, handleAbsoluteForm };
+  const closeIdle = (): void => {
+    httpAgent.destroy();
+    httpsAgent.destroy();
+  };
+
+  return { handleConnect, handleAbsoluteForm, closeIdle };
 }

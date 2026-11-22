@@ -546,6 +546,22 @@ export class DashboardState {
   getCompressionEnabled(): boolean {
     return this.compressionEnabled;
   }
+  /**
+   * Release bulky in-memory PNG and source-text ring buffers during idle sleep
+   * while keeping lifetime scalar totals and session summaries intact.
+   */
+  hibernate(): { freedImages: number; freedBytes: number } {
+    const freedImages = this.images.length;
+    let freedBytes = 0;
+    for (const img of this.images) {
+      freedBytes += img.png.byteLength + (img.sourceText ? img.sourceText.length * 2 : 0);
+    }
+    this.images = [];
+    if (this.contextHistory.length > 1) {
+      this.contextHistory = this.contextHistory.slice(-1);
+    }
+    return { freedImages, freedBytes };
+  }
   /** Resolved disk paths for the events.jsonl + 4xx-bodies sidecar dir. The
    *  new sessions / cleanup endpoints need this; legacy callers that don't
    *  pass `paths` opt out of those endpoints by returning 503. */
